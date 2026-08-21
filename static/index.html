@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trading Pipeline</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <!-- Top Bar -->
+    <header class="topbar">
+        <div class="brand">
+            <span class="logo">⚡</span>
+            <h1>Trading Pipeline</h1>
+            <span class="pill" id="sys-status">Idle</span>
+        </div>
+        <div class="controls">
+            <span class="updated" id="last-updated">--</span>
+            <button class="btn-primary" id="btn-scan">▶ Run Scan</button>
+        </div>
+    </header>
+
+    <!-- Pipeline Flow -->
+    <main class="pipeline">
+
+        <!-- ── Phase 1: Data Sources ─────────────────────── -->
+        <section class="phase" id="ph-sources">
+            <div class="phase-label">Data Sources</div>
+            <div class="source-lanes">
+                <div class="lane" id="lane-discovery">
+                    <span class="lane-icon">🔍</span>
+                    <div class="lane-info">
+                        <strong>Discovery</strong>
+                        <small>Sector ETF momentum</small>
+                    </div>
+                    <span class="lane-badge" id="disc-badge">--</span>
+                </div>
+                <div class="lane" id="lane-market">
+                    <span class="lane-icon">📊</span>
+                    <div class="lane-info">
+                        <strong>Market</strong>
+                        <small>Yahoo Finance · price & volume</small>
+                    </div>
+                    <span class="lane-badge" id="mkt-badge">--</span>
+                </div>
+                <div class="lane" id="lane-news">
+                    <span class="lane-icon">📰</span>
+                    <div class="lane-info">
+                        <strong>News</strong>
+                        <small>Yahoo News headlines</small>
+                    </div>
+                    <span class="lane-badge" id="news-badge">--</span>
+                </div>
+                <div class="lane" id="lane-social">
+                    <span class="lane-icon">💬</span>
+                    <div class="lane-info">
+                        <strong>Social</strong>
+                        <small>Reddit RSS · HackerNews</small>
+                    </div>
+                    <span class="lane-badge" id="social-badge">--</span>
+                </div>
+                <div class="lane" id="lane-sec">
+                    <span class="lane-icon">📁</span>
+                    <div class="lane-info">
+                        <strong>Fundamentals</strong>
+                        <small>SEC XBRL company facts</small>
+                    </div>
+                    <span class="lane-badge" id="sec-badge">--</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- Arrow -->
+        <div class="arrow-connector">
+            <svg width="48" height="24" viewBox="0 0 48 24" fill="none">
+                <path d="M0 12H40M32 4L40 12L32 20" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+        </div>
+
+        <!-- ── Phase 2: Research Team ────────────────────── -->
+        <section class="phase" id="ph-research">
+            <div class="phase-label">Research Team</div>
+            <div class="research-grid">
+                <div class="agent-card bull-card">
+                    <div class="card-head">
+                        <span class="card-icon bull-icon">📈</span>
+                        <strong>Bullish</strong>
+                    </div>
+                    <ul class="evidence-list" id="bull-points">
+                        <li class="placeholder">Waiting for scan...</li>
+                    </ul>
+                    <div class="evidence-label">Buy Evidence</div>
+                </div>
+
+                <div class="debate-connector">
+                    <div class="debate-pill">Discussion</div>
+                    <div class="debate-lines">
+                        <span></span><span></span><span></span>
+                    </div>
+                </div>
+
+                <div class="agent-card bear-card">
+                    <div class="card-head">
+                        <span class="card-icon bear-icon">📉</span>
+                        <strong>Bearish</strong>
+                    </div>
+                    <ul class="evidence-list" id="bear-points">
+                        <li class="placeholder">Waiting for scan...</li>
+                    </ul>
+                    <div class="evidence-label">Sell Evidence</div>
+                </div>
+            </div>
+            <div class="themes-bar" id="themes-bar"></div>
+        </section>
+
+        <!-- Arrow -->
+        <div class="arrow-connector">
+            <svg width="48" height="24" viewBox="0 0 48 24" fill="none">
+                <path d="M0 12H40M32 4L40 12L32 20" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+        </div>
+
+        <!-- ── Phase 3: Trader ───────────────────────────── -->
+        <section class="phase" id="ph-trader">
+            <div class="phase-label">Trader</div>
+            <div class="trader-body">
+                <div class="trader-icon-block">
+                    <span class="trader-avatar">🧑‍💼</span>
+                    <small>Evaluates risk/reward</small>
+                </div>
+                <div class="watchlist-compact" id="watchlist"></div>
+                <div class="risk-strip">
+                    <div class="risk-row" id="risk-regime">
+                        <strong>Risk Regime</strong>
+                        <span>--</span>
+                    </div>
+                    <div class="risk-row" id="risk-options">
+                        <strong>Options Gate</strong>
+                        <span>--</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Arrow -->
+        <div class="arrow-connector">
+            <svg width="48" height="24" viewBox="0 0 48 24" fill="none">
+                <path d="M0 12H40M32 4L40 12L32 20" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+        </div>
+
+        <!-- ── Phase 4: Execution ────────────────────────── -->
+        <section class="phase" id="ph-exec">
+            <div class="phase-label">Execution</div>
+            <div class="exec-body">
+                <div class="exec-icon">💰</div>
+                <div class="exec-rows">
+                    <div class="exec-row" id="exec-alpaca">
+                        <strong>Alpaca</strong>
+                        <span>--</span>
+                    </div>
+                    <div class="exec-row" id="exec-tv">
+                        <strong>TradingView</strong>
+                        <span>--</span>
+                    </div>
+                    <div class="exec-row" id="exec-order">
+                        <strong>Last Order</strong>
+                        <span>None</span>
+                    </div>
+                    <div class="exec-row" id="exec-decision">
+                        <strong>Decision</strong>
+                        <span>Pending</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!-- Event Log Strip -->
+    <footer class="event-strip">
+        <span class="event-title">Events</span>
+        <div class="event-scroll" id="events"></div>
+    </footer>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

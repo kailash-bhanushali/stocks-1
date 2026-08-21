@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+venv/
+runtime/*.json
+lean/**/backtests/
+lean/**/live/
+lean/**/.lean/
+
