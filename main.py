@@ -18,7 +18,15 @@ import uvicorn
 from alpaca_service import alpaca_account_summary
 from agents import OmniRouteClient, ResearcherAgent, TechnicalConfirmationAgent, TraderAgent
 from data_feed_router import DataFeedRouter
-from intelligence_agent import fetch_all_intelligence, fetch_insider_trades, fetch_congress_trades, fetch_corporate_actions, fetch_ownership, fetch_seasonality
+from intelligence_agent import (
+    fetch_all_intelligence,
+    fetch_insider_trades,
+    fetch_congress_trades,
+    fetch_corporate_actions,
+    fetch_ownership,
+    fetch_seasonality,
+    fetch_analyst_and_valuation,
+)
 from lean_adapter import build_lean_universe, write_lean_universe
 from option_streamer import alpaca_option_stream
 
@@ -1004,6 +1012,15 @@ async def intelligence_seasonality(symbol: str):
     """5-year monthly return seasonality from Yahoo Finance."""
     try:
         return fetch_seasonality(symbol.upper())
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/intelligence/{symbol}/valuation")
+async def intelligence_valuation(symbol: str):
+    """Finviz analyst price targets, recommendations, short float %, and valuation multiples."""
+    try:
+        return fetch_analyst_and_valuation(symbol.upper())
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

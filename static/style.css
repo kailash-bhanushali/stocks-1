@@ -1792,12 +1792,169 @@ button:disabled {
     background: rgba(96,165,250,0.08) !important;
     box-shadow: inset 3px 0 0 var(--blue);
 }
-.wl-row::after {
-    content: '🧠';
-    font-size: 0.7rem;
-    margin-left: auto;
-    opacity: 0.5;
-    transition: opacity 0.15s;
+
+.wl-intel-btn {
+    background: rgba(96, 165, 250, 0.12);
+    border: 1px solid rgba(96, 165, 250, 0.35);
+    color: var(--blue);
+    padding: 3px 8px;
+    border-radius: 6px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+    margin-left: 6px;
+    white-space: nowrap;
 }
-.wl-row:hover::after { opacity: 1; }
+.wl-intel-btn:hover {
+    background: var(--blue);
+    color: #000;
+    border-color: var(--blue);
+}
+
+/* ── Valuation & Analyst Target Tab Styles ── */
+
+.intel-target-hero {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 18px;
+    background: linear-gradient(135deg, rgba(96,165,250,0.08) 0%, rgba(52,211,153,0.08) 100%);
+    border-radius: 10px;
+    border: 1px solid var(--border-hi);
+    gap: 16px;
+}
+
+.target-hero-left {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.target-hero-title {
+    font-size: 0.72rem;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-weight: 600;
+}
+
+.target-hero-prices {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+}
+
+.target-hero-cur {
+    font-size: 1.4rem;
+    font-weight: 800;
+    color: var(--text);
+}
+
+.target-hero-target {
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: var(--green);
+}
+
+.target-hero-right {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 6px;
+}
+
+.target-upside-badge {
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-size: 0.82rem;
+    font-weight: 700;
+}
+.target-upside-badge.pos { background: var(--green-bg); color: var(--green); border: 1px solid var(--green); }
+.target-upside-badge.neg { background: var(--red-bg);   color: var(--red);   border: 1px solid var(--red); }
+.target-upside-badge.neutral { background: rgba(255,255,255,0.05); color: var(--muted); border: 1px solid var(--border); }
+
+.recom-pill {
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: var(--blue);
+    background: rgba(96,165,250,0.1);
+    padding: 2px 8px;
+    border-radius: 6px;
+}
+
+/* Valuation Multiples Grid */
+.intel-val-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    gap: 10px;
+}
+
+.val-card {
+    background: var(--card-alt);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    transition: border-color 0.15s;
+}
+.val-card:hover { border-color: var(--border-hi); }
+
+.val-card-label {
+    font-size: 0.68rem;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    font-weight: 600;
+}
+
+.val-card-value {
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: var(--text);
+}
+
+.val-card-sub {
+    font-size: 0.65rem;
+    color: var(--dim);
+}
+
+/* Chart Link Card */
+.intel-chart-box {
+    margin-top: 4px;
+    padding: 12px 16px;
+    background: var(--card-alt);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.chart-box-info {
+    font-size: 0.76rem;
+    color: var(--muted);
+}
+
+.btn-finviz-chart {
+    background: rgba(96,165,250,0.12);
+    color: var(--blue);
+    border: 1px solid var(--blue);
+    padding: 6px 14px;
+    border-radius: 6px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-decoration: none;
+    transition: all 0.15s;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+.btn-finviz-chart:hover {
+    background: var(--blue);
+    color: #000;
+}
+
 

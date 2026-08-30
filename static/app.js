@@ -347,8 +347,13 @@ function renderSelectedUniverse(s) {
     universe.forEach(u => {
         const badge = document.createElement('span');
         badge.className = 'uni-badge';
-        badge.innerHTML = `✓ ${u.ticker} <span class="uni-source">(${u.source})</span>`;
-        badge.title = `[Ticker: ${u.ticker}]\n[Nominated By] ${u.source}\n[Why Selected] ${u.reason}`;
+        badge.style.cursor = 'pointer';
+        badge.innerHTML = `✓ ${u.ticker} <span class="uni-source">(${u.source})</span> <span style="font-size:0.7rem;opacity:0.75;margin-left:2px;">🧠</span>`;
+        badge.title = `[Ticker: ${u.ticker}]\n[Nominated By] ${u.source}\n[Why Selected] ${u.reason}\n\n👉 Click to inspect Intelligence for ${u.ticker}`;
+        badge.onclick = (e) => {
+            e.stopPropagation();
+            openIntelDrawer(u.ticker);
+        };
         grid.appendChild(badge);
     });
 }
@@ -452,7 +457,17 @@ function renderTrader(s) {
             const sym = item.options?.selected_contract?.symbol;
             contract.textContent = sym || item.options?.status || '—';
 
-            row.append(left, contract, bias, score);
+            const intelBtn = document.createElement('button');
+            intelBtn.className = 'wl-intel-btn';
+            intelBtn.type = 'button';
+            intelBtn.textContent = '🧠 Intel';
+            intelBtn.title = `Open ${item.ticker} Intelligence Drawer`;
+            intelBtn.onclick = (e) => {
+                e.stopPropagation();
+                openIntelDrawer(item.ticker);
+            };
+
+            row.append(left, contract, bias, score, intelBtn);
 
             // Rich 1-line hover explanation
             const selReason = item.selection_reason || `Selected via ${item.theme} theme momentum.`;
@@ -464,7 +479,7 @@ function renderTrader(s) {
                 ? `\n[Intelligence] ${item.intelligence.composite_signal?.toUpperCase() || 'NEUTRAL'} (${item.intelligence.intelligence_score ?? item.intelligence_score ?? 50}/100) · ${item.intelligence.insider_summary || 'SEC filings scanned'} · ${item.intelligence.seasonality_summary || ''}`
                 : '';
 
-            row.title = `[Why Selected] ${selReason}\n[Score Breakdown] ${scoreBreak}\n[Options Detail] ${optInfo}${intelInfo}\n\n👉 Click row to open Intelligence Drawer (Insider, Congress, 8-K, 13F, Seasonality)`;
+            row.title = `[Why Selected] ${selReason}\n[Score Breakdown] ${scoreBreak}\n[Options Detail] ${optInfo}${intelInfo}\n\n👉 Click row or '🧠 Intel' button to open Intelligence Drawer`;
 
             wlEl.appendChild(row);
         });
@@ -1439,7 +1454,7 @@ function openIntelDrawer(symbol) {
     $('intel-sec-link').href = `https://www.sec.gov/cgi-bin/browse-edgar?company=${encodeURIComponent(symbol)}&CIK=&type=4&dateb=&owner=include&count=40&search_text=&action=getcompany`;
 
     // Show loading in all panels
-    ['insider', 'congress', 'actions', 'ownership', 'seasonal'].forEach(tab => {
+    ['insider', 'congress', 'actions', 'ownership', 'seasonal', 'valuation'].forEach(tab => {
         const panelId = 'itab-' + tab;
         const panel = $(panelId);
         if (panel) {
@@ -1501,7 +1516,7 @@ async function fetchIntelligence(symbol) {
         }
     } catch (err) {
         $('intel-fetch-status').textContent = `Error: ${err.message}`;
-        ['insider', 'congress', 'actions', 'ownership', 'seasonal'].forEach(tab => {
+        ['insider', 'congress', 'actions', 'ownership', 'seasonal', 'valuation'].forEach(tab => {
             const panel = $('itab-' + tab);
             if (panel) panel.innerHTML = `<div class="intel-empty">⚠ Failed to load data: ${escapeHtml(err.message)}</div>`;
         });
@@ -1518,6 +1533,7 @@ function renderIntelligence(data) {
     renderActionsPanel(data.corporate_actions);
     renderOwnershipPanel(data.ownership);
     renderSeasonalPanel(data.seasonality);
+    renderValuationPanel(data.valuation);
 }
 
 // ── Insider Trades Panel ────────────────────────────────────────
@@ -1589,7 +1605,7 @@ function renderCongressPanel(d) {
 
     const srcBar = document.createElement('div');
     srcBar.className = 'intel-source-bar';
-    srcBar.innerHTML = `📡 Source: <strong>${escapeHtml(d.source)}</strong> · <a href="${escapeHtml(d.source_url || '#')}" target="_blank" rel="noopener">View trades →</a>`;
+    srcBar.innerHTML = `📡 Source: <strong>${escapeHtml(d.source)}</strong> · <a href="${escapeHtml(d.source_url || '#')}" target="_blank" rel="noopener">View on Capitol Trades →</a>`;
     panel.appendChild(srcBar);
 
     if (d.note) {
@@ -1607,23 +1623,26 @@ function renderCongressPanel(d) {
     const tableWrap = document.createElement('div');
     tableWrap.className = 'intel-table-wrap';
     if (!d.trades || !d.trades.length) {
-        tableWrap.innerHTML = '<div class="intel-empty">No congressional trades found for this ticker.<br><small>Data from House Clerk STOCK Act disclosures.</small></div>';
+        tableWrap.innerHTML = '<div class="intel-empty">No congressional trades recorded for this ticker in the STOCK Act disclosure database.</div>';
     } else {
         const table = document.createElement('table');
         table.className = 'intel-table';
-        table.innerHTML = `<thead><tr><th>Member</th><th>Chamber</th><th>Party</th><th>Type</th><th>Amount Range</th><th>Traded</th><th>Disclosed</th></tr></thead>`;
+        table.innerHTML = `<thead><tr><th>Member / Filer</th><th>Party/State</th><th>Type</th><th>Amount Range</th><th>Traded</th><th>Disclosed</th></tr></thead>`;
         const tbody = document.createElement('tbody');
         d.trades.forEach(t => {
             const tr = document.createElement('tr');
             tr.title = t.reason || '';
             const isBuy = /buy|purchase/i.test(t.transaction_type);
             const txClass = isBuy ? 'tx-buy' : 'tx-sell';
+            const memberHtml = t.doc_url
+                ? `<a href="${escapeHtml(t.doc_url)}" target="_blank" rel="noopener" style="color:var(--text);text-decoration:none;font-weight:600">${escapeHtml(t.person)} <span style="font-size:0.65rem;color:var(--blue)">↗</span></a>`
+                : `<strong>${escapeHtml(t.person)}</strong>`;
+
             tr.innerHTML = `
-                <td>${escapeHtml(t.person)}</td>
-                <td style="color:var(--muted)">${escapeHtml(t.chamber || '—')}</td>
-                <td style="color:var(--muted)">${escapeHtml(t.party_state)}</td>
+                <td>${memberHtml}</td>
+                <td style="color:var(--muted);font-weight:500">${escapeHtml(t.party_state)}</td>
                 <td><span class="${txClass}">${escapeHtml(t.transaction_type)}</span></td>
-                <td>${escapeHtml(t.amount_range)}</td>
+                <td style="font-weight:600">${escapeHtml(t.amount_range)}</td>
                 <td style="white-space:nowrap">${escapeHtml(t.traded_on)}</td>
                 <td style="white-space:nowrap;color:var(--dim)">${escapeHtml(t.disclosed_on)}</td>
             `;
@@ -1649,7 +1668,7 @@ function renderActionsPanel(d) {
 
     const srcBar = document.createElement('div');
     srcBar.className = 'intel-source-bar';
-    srcBar.innerHTML = `📡 Source: <strong>${escapeHtml(d.source)}</strong>`;
+    srcBar.innerHTML = `📡 Source: <strong>${escapeHtml(d.source)}</strong> · <a href="${escapeHtml(d.source_url || '#')}" target="_blank" rel="noopener">View SEC Filings →</a>`;
     panel.appendChild(srcBar);
 
     const summary = document.createElement('div');
@@ -1661,7 +1680,7 @@ function renderActionsPanel(d) {
     timeline.className = 'intel-timeline';
 
     if (!d.actions || !d.actions.length) {
-        timeline.innerHTML = '<div class="intel-empty">No corporate actions found in the last 12 months.</div>';
+        timeline.innerHTML = '<div class="intel-empty">No material corporate actions recorded in the last 12 months.</div>';
     } else {
         const dotClassMap = {
             'Earnings Results': 'dot-earnings',
@@ -1675,10 +1694,14 @@ function renderActionsPanel(d) {
             item.className = 'timeline-item';
             item.title = a.reason || '';
             const dotClass = dotClassMap[a.type] || 'dot-other';
+            const titleHtml = a.url
+                ? `<a href="${escapeHtml(a.url)}" target="_blank" rel="noopener" style="color:var(--text);text-decoration:none">${escapeHtml(a.type)} <span style="font-size:0.65rem;color:var(--blue)">↗</span></a>`
+                : escapeHtml(a.type);
+
             item.innerHTML = `
                 <div class="timeline-dot ${dotClass}"></div>
                 <div class="timeline-content">
-                    <div class="timeline-type">${escapeHtml(a.type)}</div>
+                    <div class="timeline-type">${titleHtml}</div>
                     <div class="timeline-date">${escapeHtml(a.date)}</div>
                     ${a.items ? `<div class="timeline-items-label">${escapeHtml(a.items)}</div>` : ''}
                 </div>
@@ -1704,7 +1727,9 @@ function renderOwnershipPanel(d) {
 
     const srcBar = document.createElement('div');
     srcBar.className = 'intel-source-bar';
-    srcBar.innerHTML = `📡 Source: <strong>${escapeHtml(d.source)}</strong> · Total institutional: <strong>${(d.total_institutional_pct || 0).toFixed(1)}%</strong>`;
+    const instStr = d.institutional_ownership_pct ? `Institutional: <strong>${escapeHtml(d.institutional_ownership_pct)}</strong>` : `Institutional: <strong>${(d.total_institutional_pct || 0).toFixed(1)}%</strong>`;
+    const insStr = d.insider_ownership_pct ? ` · Insider: <strong>${escapeHtml(d.insider_ownership_pct)}</strong>` : '';
+    srcBar.innerHTML = `📡 Source: <strong>${escapeHtml(d.source)}</strong> · ${instStr}${insStr}`;
     panel.appendChild(srcBar);
 
     const summary = document.createElement('div');
@@ -1716,23 +1741,24 @@ function renderOwnershipPanel(d) {
     tableWrap.className = 'intel-table-wrap';
 
     if (!d.owners || !d.owners.length) {
-        tableWrap.innerHTML = '<div class="intel-empty">No institutional ownership data found.<br><small>Add a FINNHUB_API_KEY to .env for richer data.</small></div>';
+        tableWrap.innerHTML = '<div class="intel-empty">No institutional ownership filings found for this ticker.</div>';
     } else {
         const table = document.createElement('table');
         table.className = 'intel-table';
-        table.innerHTML = `<thead><tr><th>Institution</th><th>% Held</th><th>Shares</th><th>QoQ Change</th></tr></thead>`;
+        table.innerHTML = `<thead><tr><th>Institutional Holder / Fund</th><th>Filing Type</th><th>Filing Date</th><th>Period</th></tr></thead>`;
         const tbody = document.createElement('tbody');
         d.owners.forEach(o => {
             const tr = document.createElement('tr');
             tr.title = o.reason || '';
-            const change = o.change_shares || 0;
-            const dirClass = change > 0 ? 'dir-up' : (change < 0 ? 'dir-down' : 'dir-flat');
-            const dirArrow = change > 0 ? '▲' : (change < 0 ? '▼' : '–');
+            const ftype = o.percent && o.percent > 0 ? `${o.percent.toFixed(2)}%` : (o.filing_type || '13F-HR');
+            const fdate = o.filing_date || 'Recent';
+            const fperiod = o.period_ending || '—';
+
             tr.innerHTML = `
-                <td>${escapeHtml(o.name)}</td>
-                <td><strong>${(o.percent || 0).toFixed(2)}%</strong></td>
-                <td>${Number(o.shares || 0).toLocaleString()}</td>
-                <td class="${dirClass}">${dirArrow} ${Math.abs(change).toLocaleString()}</td>
+                <td><strong>${escapeHtml(o.name)}</strong></td>
+                <td><span style="color:var(--blue);font-weight:600">${escapeHtml(ftype)}</span></td>
+                <td style="color:var(--text);font-size:0.75rem">${escapeHtml(fdate)}</td>
+                <td style="color:var(--muted);font-size:0.75rem">${escapeHtml(fperiod)}</td>
             `;
             tbody.appendChild(tr);
         });
@@ -1820,6 +1846,98 @@ function renderSeasonalPanel(d) {
     }
 
     panel.appendChild(wrap);
+}
+
+// ── Valuation & Analyst Targets Panel ───────────────────────────
+
+function renderValuationPanel(d) {
+    const panel = $('itab-valuation');
+    if (!panel) return;
+    panel.innerHTML = '';
+
+    if (!d || d.error) {
+        panel.innerHTML = `<div class="intel-empty">⚠ ${escapeHtml(d?.error || 'No valuation data available')}</div>`;
+        return;
+    }
+
+    // Source bar
+    const srcBar = document.createElement('div');
+    srcBar.className = 'intel-source-bar';
+    srcBar.innerHTML = `📡 Source: <strong>${escapeHtml(d.source)}</strong> · <a href="${escapeHtml(d.source_url || '#')}" target="_blank" rel="noopener">Open Finviz Profile →</a>`;
+    panel.appendChild(srcBar);
+
+    // Summary
+    const summary = document.createElement('div');
+    summary.className = 'intel-summary';
+    summary.textContent = d.summary || '';
+    panel.appendChild(summary);
+
+    // Hero: Target Price & Upside
+    const hero = document.createElement('div');
+    hero.className = 'intel-target-hero';
+
+    const curPriceStr = d.price != null ? `$${Number(d.price).toFixed(2)}` : '—';
+    const targetPriceStr = d.target_price != null ? `$${Number(d.target_price).toFixed(2)}` : '—';
+    const upside = d.target_upside_pct;
+    const upsideBadgeClass = upside != null ? (upside > 0 ? 'pos' : (upside < 0 ? 'neg' : 'neutral')) : 'neutral';
+    const upsideText = upside != null ? `${upside >= 0 ? '+' : ''}${upside.toFixed(1)}% upside` : 'No Target';
+
+    hero.innerHTML = `
+        <div class="target-hero-left">
+            <span class="target-hero-title">Current Price vs Mean Analyst Target</span>
+            <div class="target-hero-prices">
+                <span class="target-hero-cur">${escapeHtml(curPriceStr)}</span>
+                <span style="color:var(--muted);font-size:0.9rem">➔</span>
+                <span class="target-hero-target">${escapeHtml(targetPriceStr)}</span>
+            </div>
+        </div>
+        <div class="target-hero-right">
+            <span class="target-upside-badge ${upsideBadgeClass}">${escapeHtml(upsideText)}</span>
+            <span class="recom-pill">Consensus: ${escapeHtml(d.recommendation_label || 'Buy')}</span>
+        </div>
+    `;
+    panel.appendChild(hero);
+
+    // Multiples & Short Float Grid
+    const grid = document.createElement('div');
+    grid.className = 'intel-val-grid';
+
+    const cards = [
+        { label: 'Short Float %', val: d.short_float_pct || '—', sub: d.squeeze_risk || 'Normal' },
+        { label: 'Short Ratio (DTC)', val: d.short_ratio != null ? `${d.short_ratio}d` : '—', sub: 'Days to cover' },
+        { label: 'Forward P/E', val: d.forward_pe != null ? String(d.forward_pe) : '—', sub: 'Next 12M' },
+        { label: 'Trailing P/E', val: d.pe != null ? String(d.pe) : '—', sub: 'Historical' },
+        { label: 'PEG Ratio', val: d.peg != null ? String(d.peg) : '—', sub: 'Growth-adjusted' },
+        { label: 'Profit Margin', val: d.profit_margin || '—', sub: 'Net margin' },
+        { label: 'Debt / Equity', val: d.debt_to_equity || '—', sub: 'Leverage' },
+        { label: 'Market Cap', val: d.market_cap || '—', sub: 'Total size' },
+    ];
+
+    cards.forEach(c => {
+        const card = document.createElement('div');
+        card.className = 'val-card';
+        card.innerHTML = `
+            <span class="val-card-label">${escapeHtml(c.label)}</span>
+            <span class="val-card-value">${escapeHtml(c.val)}</span>
+            <span class="val-card-sub">${escapeHtml(c.sub)}</span>
+        `;
+        grid.appendChild(card);
+    });
+    panel.appendChild(grid);
+
+    // Finviz Interactive Chart Box
+    const chartBox = document.createElement('div');
+    chartBox.className = 'intel-chart-box';
+    chartBox.innerHTML = `
+        <div class="chart-box-info">
+            <strong>Finviz Technical Chart</strong><br>
+            <span>Automated trendlines, support & resistance levels for ${escapeHtml(d.symbol)}</span>
+        </div>
+        <a href="${escapeHtml(d.source_url || '#')}" target="_blank" rel="noopener" class="btn-finviz-chart">
+            📈 View Chart & Levels ↗
+        </a>
+    `;
+    panel.appendChild(chartBox);
 }
 
 // ── Intel Tab Switching ─────────────────────────────────────────

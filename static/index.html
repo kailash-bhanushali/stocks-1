@@ -6,7 +6,7 @@
     <title>Trading Pipeline</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="/static/style.css?v=7">
 </head>
 <body>
     <!-- Top Bar -->
@@ -293,6 +293,7 @@
             <button class="intel-tab" data-itab="actions"  role="tab">📅 Actions</button>
             <button class="intel-tab" data-itab="ownership" role="tab">🏦 Ownership</button>
             <button class="intel-tab" data-itab="seasonal" role="tab">📈 Seasonal</button>
+            <button class="intel-tab" data-itab="valuation" role="tab">🎯 Valuation</button>
         </div>
 
         <!-- Tab bodies -->
@@ -353,6 +354,15 @@
                     </div>
                 </div>
             </div>
+
+            <!-- Valuation & Analyst Targets -->
+            <div class="intel-panel" id="itab-valuation">
+                <div class="intel-source-bar" id="valuation-source"></div>
+                <div class="intel-summary" id="valuation-summary"></div>
+                <div class="intel-target-hero" id="valuation-hero"></div>
+                <div class="intel-val-grid" id="valuation-grid"></div>
+                <div class="intel-chart-box" id="valuation-chart-box"></div>
+            </div>
         </div>
 
         <div class="intel-foot">
@@ -361,6 +371,6 @@
         </div>
     </aside>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=7"></script>
 </body>
 </html>
