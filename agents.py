@@ -184,6 +184,9 @@ DEFAULT_SOURCES_CONFIG = {
         "alpha_vantage_endpoint": "https://www.alphavantage.co/query",
         "massive_endpoint": "https://api.massive.com/v2/snapshot/locale/us/markets/stocks/tickers/{symbol}",
         "cboe_endpoint": "https://cdn.cboe.com/api/global/delayed_quotes/options/{underlying}.json",
+        "option_dte_min": 25,
+        "option_dte_max": 65,
+        "option_dte_target": 45,
         "unusual_flow": {
             "min_vol_oi_ratio": 3.0,
             "min_premium_dollars": 10000,
@@ -223,6 +226,9 @@ DEFAULT_SOURCES_CONFIG = {
             "alpha_vantage_endpoint": _field("Alpha Vantage endpoint", "url", "HTTP(S) query endpoint; function, symbol, and API key are query parameters."),
             "massive_endpoint": _field("Massive snapshot endpoint", "url", "HTTP(S) URL template containing {symbol}."),
             "cboe_endpoint": _field("Cboe options endpoint", "url", "HTTP(S) URL template containing {underlying}."),
+            "option_dte_min": _field("Option min DTE", "integer", "Minimum days to expiration for contract selection. Contracts expiring sooner are excluded.", min=1, max=180),
+            "option_dte_max": _field("Option max DTE", "integer", "Maximum days to expiration for contract selection. Contracts expiring later are excluded.", min=7, max=365),
+            "option_dte_target": _field("Option ideal DTE", "integer", "Ideal days to expiration that receives the highest DTE score. Contracts closer to this value are preferred.", min=1, max=365),
             "unusual_flow": _field("Unusual options flow config", "object", "Thresholds for the Vol/OI unusual flow scanner. Adjust min_vol_oi_ratio (default 3.0) and min_premium_dollars (default 10000) to tune sensitivity."),
         },
     },
@@ -1729,13 +1735,16 @@ class OptionsValidationAgent:
         today = date.today()
         side_type = "C" if bias == "call" else "P"
         max_premium = float(os.getenv("MAX_OPTION_PREMIUM", "1000"))
+        dte_min = int(config.get("option_dte_min", 25))
+        dte_max = int(config.get("option_dte_max", 65))
+        dte_target = int(config.get("option_dte_target", 45))
         liquid = []
         for option in options:
             parsed = self._parse_occ(option.get("option", ""))
             if not parsed or parsed["type"] != side_type:
                 continue
             dte = (parsed["expiration"] - today).days
-            if dte < 25 or dte > 65:
+            if dte < dte_min or dte > dte_max:
                 continue
             bid = float(option.get("bid") or 0)
             ask = float(option.get("ask") or 0)
@@ -1752,7 +1761,7 @@ class OptionsValidationAgent:
             delta_abs = abs(float(delta)) if delta is not None else None
             if spread_pct > 0.25 or oi < 50:
                 continue
-            contract_score = self._contract_score(dte, delta_abs, spread_pct, oi, volume)
+            contract_score = self._contract_score(dte, delta_abs, spread_pct, oi, volume, dte_target)
             liquid.append({
                 "symbol": option.get("option"),
                 "expiration": parsed["expiration"].isoformat(),
@@ -1775,7 +1784,7 @@ class OptionsValidationAgent:
             return {
                 "status": "no_liquid_contract",
                 "score": 0,
-                "reason": "No 25-65 DTE contract passed premium, spread, and open-interest filters.",
+                "reason": f"No {dte_min}-{dte_max} DTE contract passed premium, spread, and open-interest filters.",
                 "selected_contract": None,
                 "contracts_checked": len(options),
                 "timestamp": payload.get("timestamp"),
@@ -1807,8 +1816,8 @@ class OptionsValidationAgent:
             "strike": strike,
         }
 
-    def _contract_score(self, dte, delta_abs, spread_pct, oi, volume):
-        dte_score = clamp(100 - abs(dte - 45) * 2)
+    def _contract_score(self, dte, delta_abs, spread_pct, oi, volume, dte_target=45):
+        dte_score = clamp(100 - abs(dte - dte_target) * 2)
         delta_score = 65 if delta_abs is None else clamp(100 - abs(delta_abs - 0.40) * 220)
         spread_score = clamp(100 - spread_pct * 420)
         oi_score = clamp(math.log10(oi + 1) * 24)
@@ -2715,10 +2724,13 @@ class TraderAgent:
             "status": "pass" if contract["open_interest"] >= 100 else "warn",
             "message": f"Open interest {contract['open_interest']}",
         })
+        mkt_cfg = sources_config.get("market", {})
+        dte_min = int(mkt_cfg.get("option_dte_min", 25))
+        dte_max = int(mkt_cfg.get("option_dte_max", 65))
         checks.append({
             "name": "dte",
-            "status": "pass" if 25 <= contract["dte"] <= 65 else "fail",
-            "message": f"{contract['dte']} DTE",
+            "status": "pass" if dte_min <= contract["dte"] <= dte_max else "fail",
+            "message": f"{contract['dte']} DTE (allowed {dte_min}-{dte_max})",
         })
         flow = watch.get("flow", {})
         if flow.get("has_unusual_activity"):

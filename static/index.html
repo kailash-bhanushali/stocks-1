@@ -104,22 +104,14 @@
             </svg>
         </div>
 
-        <!-- ── Data Sources Final Selection Summary Card ── -->
-        <section class="phase selection-phase" id="ph-selection">
-            <div class="phase-label">
-                <span>Selected Universe</span>
-                <span class="pill-sm" id="universe-count">0 Selected</span>
+        <!-- ── Selected Universe (Compact Card) ── -->
+        <div class="compact-phase-card" id="compact-selection" title="Click to view Selected Universe">
+            <span class="compact-icon">🎯</span>
+            <div class="compact-info">
+                <strong>Selected Universe</strong>
             </div>
-            <div class="selection-body">
-                <div class="selection-head">
-                    <span class="selection-icon">🎯</span>
-                    <small>Final candidate tickers passed to Research Team</small>
-                </div>
-                <div class="universe-grid" id="universe-grid">
-                    <span class="empty-hint">Run scan to populate dynamic universe</span>
-                </div>
-            </div>
-        </section>
+            <span class="compact-badge" id="compact-selection-badge">0 tickers</span>
+        </div>
 
         <!-- Arrow -->
         <div class="arrow-connector">
@@ -128,41 +120,14 @@
             </svg>
         </div>
 
-        <!-- ── Phase 2: Research Team ────────────────────── -->
-        <section class="phase" id="ph-research">
-            <div class="phase-label">Research Team</div>
-            <div class="research-grid">
-                <div class="agent-card bull-card">
-                    <div class="card-head">
-                        <span class="card-icon bull-icon">📈</span>
-                        <strong>Bullish</strong>
-                    </div>
-                    <ul class="evidence-list" id="bull-points">
-                        <li class="placeholder">Waiting for scan...</li>
-                    </ul>
-                    <div class="evidence-label">Buy Evidence</div>
-                </div>
-
-                <div class="debate-connector">
-                    <div class="debate-pill">Discussion</div>
-                    <div class="debate-lines">
-                        <span></span><span></span><span></span>
-                    </div>
-                </div>
-
-                <div class="agent-card bear-card">
-                    <div class="card-head">
-                        <span class="card-icon bear-icon">📉</span>
-                        <strong>Bearish</strong>
-                    </div>
-                    <ul class="evidence-list" id="bear-points">
-                        <li class="placeholder">Waiting for scan...</li>
-                    </ul>
-                    <div class="evidence-label">Sell Evidence</div>
-                </div>
+        <!-- ── Research Team (Compact Card) ── -->
+        <div class="compact-phase-card" id="compact-research" title="Click to view Research Team">
+            <span class="compact-icon">🔬</span>
+            <div class="compact-info">
+                <strong>Research Team</strong>
             </div>
-            <div class="themes-bar" id="themes-bar"></div>
-        </section>
+            <span class="compact-badge" id="compact-research-badge">--</span>
+        </div>
 
         <!-- Arrow -->
         <div class="arrow-connector">
@@ -370,6 +335,71 @@
             <a id="intel-sec-link" href="#" target="_blank" rel="noopener" class="intel-ext-link">🔗 View on SEC EDGAR</a>
         </div>
     </aside>
+
+    <!-- ── Selected Universe Modal ── -->
+    <div class="modal-overlay" id="selection-modal" style="display:none;">
+        <div class="modal-card compact-modal-card">
+            <div class="modal-head">
+                <div>
+                    <h2>🎯 Selected Universe</h2>
+                    <small>Final candidate tickers passed to Research Team</small>
+                </div>
+                <button class="modal-close" id="selection-modal-close" aria-label="Close">✕</button>
+            </div>
+            <div class="modal-body">
+                <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+                    <span class="pill-sm" id="universe-count">0 Selected</span>
+                </div>
+                <div class="universe-grid" id="universe-grid">
+                    <span class="empty-hint">Run scan to populate dynamic universe</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Research Team Modal ── -->
+    <div class="modal-overlay" id="research-modal" style="display:none;">
+        <div class="modal-card compact-modal-card">
+            <div class="modal-head">
+                <div>
+                    <h2>🔬 Research Team</h2>
+                    <small>Bull/Bear debate, evidence, and active themes</small>
+                </div>
+                <button class="modal-close" id="research-modal-close" aria-label="Close">✕</button>
+            </div>
+            <div class="modal-body">
+                <div class="research-grid">
+                    <div class="agent-card bull-card">
+                        <div class="card-head">
+                            <span class="card-icon bull-icon">📈</span>
+                            <strong>Bullish</strong>
+                        </div>
+                        <ul class="evidence-list" id="bull-points">
+                            <li class="placeholder">Waiting for scan...</li>
+                        </ul>
+                        <div class="evidence-label">Buy Evidence</div>
+                    </div>
+                    <div class="debate-connector">
+                        <div class="debate-pill">Discussion</div>
+                        <div class="debate-lines">
+                            <span></span><span></span><span></span>
+                        </div>
+                    </div>
+                    <div class="agent-card bear-card">
+                        <div class="card-head">
+                            <span class="card-icon bear-icon">📉</span>
+                            <strong>Bearish</strong>
+                        </div>
+                        <ul class="evidence-list" id="bear-points">
+                            <li class="placeholder">Waiting for scan...</li>
+                        </ul>
+                        <div class="evidence-label">Sell Evidence</div>
+                    </div>
+                </div>
+                <div class="themes-bar" id="themes-bar"></div>
+            </div>
+        </div>
+    </div>
 
     <script src="/static/app.js?v=8"></script>
 </body>

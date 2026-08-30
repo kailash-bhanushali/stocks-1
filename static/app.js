@@ -9,6 +9,19 @@ const escapeHtml = (value) => String(value ?? '')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#039;');
 
+function decodeOccSymbol(sym) {
+    if (!sym || sym.length < 15) return '';
+    const match = sym.match(/^([A-Z]{1,6})\s*(\d{6})([CP])(\d{8})$/);
+    if (!match) return '';
+    const dateStr = match[2];
+    const type = match[3] === 'C' ? 'Call' : 'Put';
+    const strike = (parseInt(match[4], 10) / 1000).toFixed(match[4].slice(-3) === '000' ? 0 : 1);
+    const mm = dateStr.slice(0, 2);
+    const dd = dateStr.slice(2, 4);
+    const yy = dateStr.slice(4, 6);
+    return `${mm}/${dd}/${yy} $${strike} ${type}`;
+}
+
 // ── State polling ──────────────────────────────────────────────
 let latestState = {};
 
@@ -112,11 +125,18 @@ function renderSources(s) {
     setLaneDetail(
         'lane-sec',
         'sec-badge',
-        secAgent ? `SEC XBRL company facts verified (${secAgent.duration_ms}ms)` : 'Waiting for scan',
-        secAgent ? `${secAgent.duration_ms}ms` : '--',
+        secAgent ? `SEC XBRL company facts verified` : 'Waiting for scan',
+        secAgent ? `Verified` : '--',
         secAgent?.status === 'ok' ? 'ok' : secAgent?.status === 'degraded' ? 'warn' : null,
         `Source used: ${(fundamentals.sources_used || []).join(', ') || fundamentals.source || 'not run'}. Revenue and net-income tags, thresholds, and score weights are configurable.`
     );
+
+    const findAgentMs = (id) => (agents.find(a => a.id === id) || {}).duration_ms;
+    appendLaneMs('disc-badge', findAgentMs('discovery'));
+    appendLaneMs('mkt-badge', findAgentMs('market'));
+    appendLaneMs('news-badge', findAgentMs('news'));
+    appendLaneMs('social-badge', findAgentMs('social'));
+    appendLaneMs('sec-badge', findAgentMs('fundamentals'));
 
     renderDrawers(s);
     renderSelectedUniverse(s);
@@ -134,6 +154,16 @@ function setLaneDetail(laneId, badgeId, subtext, badgeText, status, tooltip) {
         badge.textContent = badgeText;
         badge.className = 'lane-badge' + (status ? ` is-${status}` : '');
     }
+}
+
+function appendLaneMs(badgeId, ms) {
+    if (ms == null) return;
+    const badge = $(badgeId);
+    if (!badge) return;
+    const span = document.createElement('span');
+    span.className = 'lane-ms';
+    span.textContent = ' · ' + Number(ms).toLocaleString() + 'ms';
+    badge.appendChild(span);
 }
 
 // ── Drawers (Expandable Scanned Items) ──────────────────────────
@@ -339,6 +369,9 @@ function renderSelectedUniverse(s) {
 
     if (countEl) countEl.textContent = `${universe.length} Selected`;
 
+    const compactSelBadge = $('compact-selection-badge');
+    if (compactSelBadge) compactSelBadge.textContent = `${universe.length} tickers`;
+
     if (!universe.length) {
         grid.innerHTML = '<span class="empty-hint">Run scan to populate dynamic universe</span>';
         return;
@@ -402,6 +435,16 @@ function renderResearch(s) {
     const themesBar = $('themes-bar');
     themesBar.replaceChildren();
     const themes = s.research?.themes || [];
+
+    const compactResBadge = $('compact-research-badge');
+    if (compactResBadge) {
+        const regime = debate?.risk?.market_regime;
+        const parts = [];
+        if (themes.length) parts.push(`${themes.length} themes`);
+        if (regime) parts.push(regime);
+        compactResBadge.textContent = parts.length ? parts.join(' · ') : '--';
+    }
+
     if (!themes.length) {
         const empty = document.createElement('span');
         empty.className = 'theme-pill';
@@ -656,8 +699,8 @@ function renderOptionStream() {
     if (!el) return;
     el.replaceChildren();
 
-    const entries = Object.values(optionStreamData);
-    if (!entries.length) {
+    const allEntries = Object.values(optionStreamData);
+    if (!allEntries.length) {
         const empty = document.createElement('div');
         empty.className = 'stream-empty';
         empty.textContent = 'Waiting for live quotes...';
@@ -665,13 +708,53 @@ function renderOptionStream() {
         return;
     }
 
+    const wl = (latestState.research?.watchlist || []).slice(0, 6);
+    const contractSymbols = new Set();
+    wl.forEach(item => {
+        const sym = item.options?.selected_contract?.symbol;
+        if (sym) contractSymbols.add(sym);
+    });
+
+    const entries = contractSymbols.size > 0
+        ? allEntries.filter(q => contractSymbols.has(q.symbol))
+        : [];
+
+    if (!entries.length) {
+        const empty = document.createElement('div');
+        empty.className = 'stream-empty';
+        empty.textContent = contractSymbols.size === 0
+            ? 'Waiting for evaluated contracts...'
+            : 'No matching contracts in stream';
+        el.appendChild(empty);
+        return;
+    }
+
+    const contractToTicker = {};
+    wl.forEach(item => {
+        const csym = item.options?.selected_contract?.symbol;
+        if (csym) contractToTicker[csym] = item.ticker;
+    });
+
     entries.slice(0, 8).forEach(q => {
         const row = document.createElement('div');
         row.className = 'stream-row';
 
-        const sym = document.createElement('span');
-        sym.className = 'stream-symbol';
-        sym.textContent = q.symbol;
+        const ticker = contractToTicker[q.symbol] || '';
+        const decoded = decodeOccSymbol(q.symbol);
+
+        const symWrap = document.createElement('div');
+        symWrap.className = 'stream-symbol-wrap';
+        if (ticker) {
+            const tkEl = document.createElement('span');
+            tkEl.className = 'stream-ticker';
+            tkEl.textContent = ticker;
+            symWrap.appendChild(tkEl);
+        }
+        const detail = document.createElement('span');
+        detail.className = 'stream-contract-detail';
+        detail.textContent = decoded || q.symbol;
+        detail.title = q.symbol;
+        symWrap.appendChild(detail);
 
         const bid = document.createElement('span');
         bid.className = 'stream-bid';
@@ -686,7 +769,7 @@ function renderOptionStream() {
         const livePrice = q.last ?? q.price ?? q.mid;
         last.textContent = livePrice != null ? `M $${Number(livePrice).toFixed(2)}` : 'M --';
 
-        row.append(sym, bid, ask, last);
+        row.append(symWrap, bid, ask, last);
         el.appendChild(row);
     });
 }
@@ -1437,6 +1520,10 @@ document.addEventListener('keydown', event => {
         if (drawer && (drawer.style.display !== 'none' || drawer.classList.contains('is-open'))) {
             closeIntelDrawer();
         }
+        const sm = $('selection-modal');
+        if (sm && sm.style.display !== 'none') closeCompactModal('selection-modal');
+        const rm = $('research-modal');
+        if (rm && rm.style.display !== 'none') closeCompactModal('research-modal');
     }
 });
 
@@ -2043,6 +2130,36 @@ if (wlEl) {
         if (tickerEl) openIntelDrawer(tickerEl.textContent.trim());
     });
 }
+
+// ── Compact Phase Card Modals ─────────────────────────────────
+
+function openCompactModal(modalId) {
+    const modal = $(modalId);
+    if (modal) { modal.style.display = 'flex'; document.body.classList.add('modal-open'); }
+}
+
+function closeCompactModal(modalId) {
+    const modal = $(modalId);
+    if (modal) { modal.style.display = 'none'; document.body.classList.remove('modal-open'); }
+}
+
+const compactSelection = $('compact-selection');
+if (compactSelection) compactSelection.addEventListener('click', () => openCompactModal('selection-modal'));
+
+const selModalClose = $('selection-modal-close');
+if (selModalClose) selModalClose.addEventListener('click', () => closeCompactModal('selection-modal'));
+
+const selModal = $('selection-modal');
+if (selModal) selModal.addEventListener('click', (e) => { if (e.target === selModal) closeCompactModal('selection-modal'); });
+
+const compactResearch = $('compact-research');
+if (compactResearch) compactResearch.addEventListener('click', () => openCompactModal('research-modal'));
+
+const resModalClose = $('research-modal-close');
+if (resModalClose) resModalClose.addEventListener('click', () => closeCompactModal('research-modal'));
+
+const resModal = $('research-modal');
+if (resModal) resModal.addEventListener('click', (e) => { if (e.target === resModal) closeCompactModal('research-modal'); });
 
 // ── Boot ───────────────────────────────────────────────────────
 fetchState();
