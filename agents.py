@@ -184,6 +184,12 @@ DEFAULT_SOURCES_CONFIG = {
         "alpha_vantage_endpoint": "https://www.alphavantage.co/query",
         "massive_endpoint": "https://api.massive.com/v2/snapshot/locale/us/markets/stocks/tickers/{symbol}",
         "cboe_endpoint": "https://cdn.cboe.com/api/global/delayed_quotes/options/{underlying}.json",
+        "unusual_flow": {
+            "min_vol_oi_ratio": 3.0,
+            "min_premium_dollars": 10000,
+            "min_open_interest": 50,
+            "max_dte": 90,
+        },
         "field_schema": {
             "custom_sources": _field("Custom market sources", "source_list", "Managed through Add Source.", hidden=True),
             "enabled_sources": _field("Enabled market sources", "list", "Comma-separated source IDs. yahoo_chart is the technical-bar source; the others are live quote-router fallbacks.", choices=["yahoo_chart", "alpaca", "cboe", "finnhub", "alpha_vantage", "massive"]),
@@ -217,6 +223,7 @@ DEFAULT_SOURCES_CONFIG = {
             "alpha_vantage_endpoint": _field("Alpha Vantage endpoint", "url", "HTTP(S) query endpoint; function, symbol, and API key are query parameters."),
             "massive_endpoint": _field("Massive snapshot endpoint", "url", "HTTP(S) URL template containing {symbol}."),
             "cboe_endpoint": _field("Cboe options endpoint", "url", "HTTP(S) URL template containing {underlying}."),
+            "unusual_flow": _field("Unusual options flow config", "object", "Thresholds for the Vol/OI unusual flow scanner. Adjust min_vol_oi_ratio (default 3.0) and min_premium_dollars (default 10000) to tune sensitivity."),
         },
     },
     "news": {
@@ -1815,6 +1822,196 @@ class OptionsValidationAgent:
         )
 
 
+class UnusualOptionsFlowAgent:
+    """Scans CBOE delayed option chains for unusual volume relative to open interest.
+
+    A Vol/OI ratio >= 3.0 on a single contract with meaningful premium is one of
+    the most reliable leading indicators of informed positioning.  This agent
+    scans every contract in the chain (both calls and puts), ranks anomalies,
+    and returns a per-symbol flow digest that downstream scoring can use.
+    """
+
+    def run(self, symbols, market_metrics):
+        config = get_sources_config()["market"]
+        if "cboe" not in config["enabled_sources"]:
+            return {
+                "summary": "Unusual options flow scan disabled (cboe not in enabled_sources)",
+                "status": "disabled",
+                "flow_signals": {},
+                "errors": {},
+            }
+        flow_config = config.get("unusual_flow", {})
+        min_vol_oi = float(flow_config.get("min_vol_oi_ratio", 3.0))
+        min_premium = float(flow_config.get("min_premium_dollars", 10000))
+        min_oi = int(flow_config.get("min_open_interest", 50))
+        max_dte = int(flow_config.get("max_dte", 90))
+
+        flow_signals = {}
+        errors = {}
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            futures = {
+                executor.submit(
+                    self._scan_symbol, symbol, market_metrics.get(symbol, {}),
+                    config, min_vol_oi, min_premium, min_oi, max_dte,
+                ): symbol
+                for symbol in sorted(set(symbols))
+            }
+            for future in as_completed(futures):
+                symbol = futures[future]
+                try:
+                    result = future.result()
+                    if result:
+                        flow_signals[symbol] = result
+                except Exception as exc:
+                    errors[symbol] = str(exc)[:200]
+
+        flagged = sum(1 for sig in flow_signals.values() if sig["has_unusual_activity"])
+        return {
+            "summary": f"Unusual options flow: {flagged} of {len(flow_signals)} symbols flagged",
+            "source": "Cboe delayed options (Vol/OI scan)",
+            "status": "degraded" if errors else "ok",
+            "flow_signals": flow_signals,
+            "errors": errors,
+        }
+
+    def _scan_symbol(self, symbol, market_metric, config, min_vol_oi, min_premium, min_oi, max_dte):
+        url = config["cboe_endpoint"].replace("{underlying}", urllib.parse.quote(symbol))
+        response = requests.get(url, headers=HTTP_HEADERS, timeout=config["request_timeout_seconds"])
+        response.raise_for_status()
+        payload = response.json()
+        options = payload.get("data", {}).get("options") or []
+        current_price = market_metric.get("price") or payload.get("data", {}).get("current_price")
+        today = date.today()
+        unusual = []
+        total_call_vol = 0
+        total_put_vol = 0
+        total_call_oi = 0
+        total_put_oi = 0
+
+        for option in options:
+            symbol_str = option.get("option", "")
+            parsed = self._parse_occ(symbol_str)
+            if not parsed:
+                continue
+            dte = (parsed["expiration"] - today).days
+            if dte < 1 or dte > max_dte:
+                continue
+
+            volume = float(option.get("volume") or 0)
+            oi = float(option.get("open_interest") or 0)
+            bid = float(option.get("bid") or 0)
+            ask = float(option.get("ask") or 0)
+            mid = (bid + ask) / 2 if bid and ask else float(option.get("last_trade_price") or 0)
+
+            side = "call" if parsed["type"] == "C" else "put"
+            if side == "call":
+                total_call_vol += volume
+                total_call_oi += oi
+            else:
+                total_put_vol += volume
+                total_put_oi += oi
+
+            if oi < min_oi or volume < 1:
+                continue
+
+            vol_oi = volume / oi
+            premium_total = mid * volume * 100
+            if vol_oi < min_vol_oi or premium_total < min_premium:
+                continue
+
+            delta = option.get("delta")
+            iv = option.get("iv")
+            unusual.append({
+                "contract": symbol_str,
+                "side": side,
+                "strike": parsed["strike"],
+                "expiration": parsed["expiration"].isoformat(),
+                "dte": dte,
+                "volume": int(volume),
+                "open_interest": int(oi),
+                "vol_oi_ratio": safe_round(vol_oi),
+                "mid": safe_round(mid),
+                "premium_total": int(premium_total),
+                "bid": safe_round(bid),
+                "ask": safe_round(ask),
+                "iv": safe_round(iv),
+                "delta": safe_round(delta),
+            })
+
+        unusual.sort(key=lambda c: c["premium_total"], reverse=True)
+        top_contracts = unusual[:5]
+
+        total_vol = total_call_vol + total_put_vol
+        put_call_ratio = safe_round(total_put_vol / total_call_vol) if total_call_vol > 0 else None
+        call_pct = safe_round((total_call_vol / total_vol) * 100) if total_vol > 0 else None
+
+        bullish = sum(1 for c in top_contracts if c["side"] == "call")
+        bearish = sum(1 for c in top_contracts if c["side"] == "put")
+        if bullish > bearish:
+            sentiment = "bullish"
+        elif bearish > bullish:
+            sentiment = "bearish"
+        else:
+            sentiment = "neutral"
+
+        max_premium_contract = top_contracts[0] if top_contracts else None
+        flow_score = self._compute_flow_score(top_contracts, put_call_ratio, total_vol, total_call_oi + total_put_oi)
+
+        return {
+            "has_unusual_activity": len(top_contracts) > 0,
+            "unusual_count": len(unusual),
+            "flow_score": flow_score,
+            "flow_sentiment": sentiment,
+            "put_call_ratio": put_call_ratio,
+            "call_volume_pct": call_pct,
+            "total_option_volume": int(total_vol),
+            "total_open_interest": int(total_call_oi + total_put_oi),
+            "top_contracts": top_contracts,
+            "headline": self._headline(symbol, top_contracts, sentiment, max_premium_contract),
+            "current_price": safe_round(current_price),
+        }
+
+    def _compute_flow_score(self, top_contracts, put_call_ratio, total_vol, total_oi):
+        """0-100 score reflecting strength of unusual flow signal."""
+        if not top_contracts:
+            return 0
+        count_score = clamp(len(top_contracts) * 18)
+        avg_vol_oi = statistics.fmean([c["vol_oi_ratio"] for c in top_contracts])
+        intensity_score = clamp(min(avg_vol_oi, 20) * 5)
+        premium_total = sum(c["premium_total"] for c in top_contracts)
+        premium_score = clamp(math.log10(max(premium_total, 1)) * 12)
+        return int(
+            count_score * 0.30
+            + intensity_score * 0.40
+            + premium_score * 0.30
+        )
+
+    def _headline(self, symbol, top_contracts, sentiment, biggest):
+        if not top_contracts:
+            return f"{symbol}: no unusual options flow detected"
+        total_prem = sum(c["premium_total"] for c in top_contracts)
+        prem_str = f"${total_prem:,.0f}" if total_prem >= 1000 else f"${total_prem}"
+        return (
+            f"{symbol}: {len(top_contracts)} unusual contract(s), "
+            f"{prem_str} total premium, {sentiment} skew"
+        )
+
+    def _parse_occ(self, symbol):
+        match = re.match(r"^([A-Z]{1,6})(\d{2})(\d{2})(\d{2})([CP])(\d{8})$", symbol or "")
+        if not match:
+            return None
+        year = 2000 + int(match.group(2))
+        month = int(match.group(3))
+        day = int(match.group(4))
+        strike = int(match.group(6)) / 1000
+        return {
+            "root": match.group(1),
+            "expiration": date(year, month, day),
+            "type": match.group(5),
+            "strike": strike,
+        }
+
+
 class ResearcherAgent:
     def __init__(self, llm_client: OmniRouteClient = None):
         self.llm = llm_client or OmniRouteClient()
@@ -1824,6 +2021,7 @@ class ResearcherAgent:
         self.social_agent = SocialSentimentAgent()
         self.fundamentals_agent = FundamentalsAgent()
         self.options_agent = OptionsValidationAgent()
+        self.flow_agent = UnusualOptionsFlowAgent()
         self.discovery_agent = SectorDiscoveryAgent()
 
     def scan_market(self, market_digest: str = "") -> dict:
@@ -1853,7 +2051,7 @@ class ResearcherAgent:
         } | set(alpaca_extras) | set(scan_config["market"]["benchmark_symbols"]))
 
         # ── Phase 2: Deep Analysis ─────────────────────────────
-        with ThreadPoolExecutor(max_workers=4) as executor:
+        with ThreadPoolExecutor(max_workers=5) as executor:
             futures = {
                 executor.submit(timed_agent, "market", "Market Data Agent", lambda: self.market_agent.run(universe_symbols)): "market",
                 executor.submit(timed_agent, "news", "News Agent", lambda: self.news_agent.run(active_themes)): "news",
@@ -1876,13 +2074,14 @@ class ResearcherAgent:
         )
         top_for_deep_checks = preliminary[:scan_config["fundamentals"]["max_symbols"]]
 
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        deep_check_symbols = [item["ticker"] for item in top_for_deep_checks]
+        with ThreadPoolExecutor(max_workers=3) as executor:
             futures = {
                 executor.submit(
                     timed_agent,
                     "fundamentals",
                     "Fundamentals Agent",
-                    lambda: self.fundamentals_agent.run([item["ticker"] for item in top_for_deep_checks])
+                    lambda: self.fundamentals_agent.run(deep_check_symbols)
                 ): "fundamentals",
                 executor.submit(
                     timed_agent,
@@ -1890,6 +2089,12 @@ class ResearcherAgent:
                     "Options Liquidity Agent",
                     lambda: self.options_agent.run(top_for_deep_checks, market.get("metrics", {}))
                 ): "options",
+                executor.submit(
+                    timed_agent,
+                    "flow",
+                    "Unusual Options Flow Agent",
+                    lambda: self.flow_agent.run(deep_check_symbols, market.get("metrics", {}))
+                ): "flow",
             }
             for future in as_completed(futures):
                 key = futures[future]
@@ -1901,6 +2106,7 @@ class ResearcherAgent:
             preliminary,
             results.get("fundamentals", {}),
             results.get("options", {}),
+            results.get("flow", {}),
         )
         debate = self._debate_summary(themes, watchlist, market)
         agent_runs.extend(self._decision_agent_runs(debate, watchlist))
@@ -1958,6 +2164,15 @@ class ResearcherAgent:
                     "sources_used": results.get("fundamentals", {}).get("sources_used", []),
                     "symbols_loaded": len(results.get("fundamentals", {}).get("fundamentals", {})),
                     "errors": results.get("fundamentals", {}).get("errors", {}),
+                },
+                "flow": {
+                    "source": results.get("flow", {}).get("source"),
+                    "symbols_scanned": len(results.get("flow", {}).get("flow_signals", {})),
+                    "flagged": sum(
+                        1 for sig in results.get("flow", {}).get("flow_signals", {}).values()
+                        if sig.get("has_unusual_activity")
+                    ),
+                    "errors": results.get("flow", {}).get("errors", {}),
                 },
             },
             "token_policy": {
@@ -2078,10 +2293,11 @@ class ResearcherAgent:
             config["sentiment_word_weight"],
         )
 
-    def _build_watchlist(self, preliminary, fundamentals, options):
+    def _build_watchlist(self, preliminary, fundamentals, options, flow=None):
         fundamentals_config = get_sources_config()["fundamentals"]
         fundamental_by_symbol = fundamentals.get("fundamentals", {})
         option_by_symbol = options.get("validations", {})
+        flow_by_symbol = (flow or {}).get("flow_signals", {})
 
         shortlisted = [
             item for item in preliminary
@@ -2127,17 +2343,22 @@ class ResearcherAgent:
             intel_score = intel.get("intelligence_score", 50)
             intel_sig = intel.get("composite_signal", "neutral")
 
-            # Balanced weights: preliminary (50%), options liquidity (20%), SEC fundamentals (15%), US intelligence (15%)
-            preliminary_weight = 0.50
-            options_weight = 0.20
-            fundamentals_weight = 0.15
-            intel_weight = 0.15
+            flow_signal = flow_by_symbol.get(item["ticker"], {})
+            flow_score = flow_signal.get("flow_score", 0)
+            flow_sentiment = flow_signal.get("flow_sentiment", "neutral")
+
+            preliminary_weight = 0.45
+            options_weight = 0.18
+            fundamentals_weight = 0.12
+            intel_weight = 0.12
+            flow_weight = 0.13
 
             score = clamp(
                 item["pre_options_score"] * preliminary_weight
                 + option_validation.get("score", 0) * options_weight
                 + fundamental_score * fundamentals_weight
                 + intel_score * intel_weight
+                + flow_score * flow_weight
             )
 
             risk_notes = []
@@ -2149,6 +2370,13 @@ class ResearcherAgent:
                     risk_notes.append("Premium near max risk cap")
             if score < 65:
                 risk_notes.append("Score is watch-only until stronger confirmation")
+            if flow_signal.get("has_unusual_activity") and flow_sentiment != "neutral":
+                bias_aligned = (
+                    (flow_sentiment == "bullish" and item["bias"] == "call")
+                    or (flow_sentiment == "bearish" and item["bias"] == "put")
+                )
+                if not bias_aligned:
+                    risk_notes.append(f"Unusual options flow is {flow_sentiment}, opposing {item['bias']} bias")
 
             for bear_note in intel.get("bear_catalysts", []):
                 risk_notes.append(bear_note)
@@ -2160,14 +2388,19 @@ class ResearcherAgent:
             rev_yoy = fundamental.get("revenue_yoy")
             rev_str = f"+{rev_yoy:.1f}% YoY Rev" if rev_yoy is not None else "SEC baseline"
 
+            flow_str = ""
+            if flow_signal.get("has_unusual_activity"):
+                flow_str = f", {flow_score}/100 unusual flow ({flow_sentiment})"
+
             selection_reason = (
                 f"Selected via active theme '{item.get('theme')}' with {tech_sc}/100 price momentum, "
-                f"{news_sc}/100 news sentiment, {rev_str} & {intel_score}/100 intelligence ({intel_sig})."
+                f"{news_sc}/100 news sentiment, {rev_str} & {intel_score}/100 intelligence ({intel_sig})"
+                f"{flow_str}."
             )
             score_breakdown = (
-                f"Score {int(score)}/100 = preliminary multi-source {item['pre_options_score']} (50%) + "
-                f"option liquidity {opt_sc} (20%) + SEC fundamentals {fund_sc} (15%) + "
-                f"US intelligence {intel_score} (15%)."
+                f"Score {int(score)}/100 = preliminary multi-source {item['pre_options_score']} (45%) + "
+                f"option liquidity {opt_sc} (18%) + SEC fundamentals {fund_sc} (12%) + "
+                f"US intelligence {intel_score} (12%) + unusual flow {flow_score} (13%)."
             )
 
             enriched = dict(item)
@@ -2175,9 +2408,11 @@ class ResearcherAgent:
                 "score": int(score),
                 "fundamental_score": int(fundamental_score),
                 "intelligence_score": int(intel_score),
+                "flow_score": int(flow_score),
                 "fundamentals": fundamental,
                 "intelligence": intel,
                 "options": option_validation,
+                "flow": flow_signal if flow_signal.get("has_unusual_activity") else {"has_unusual_activity": False, "flow_score": 0},
                 "risk_notes": risk_notes,
                 "selection_reason": selection_reason,
                 "score_breakdown": score_breakdown,
@@ -2199,6 +2434,13 @@ class ResearcherAgent:
                 bull_points.append(
                     f"{item['ticker']} has validated {contract['dte']} DTE {contract['type']} liquidity with {contract['open_interest']} OI."
                 )
+            flow = item.get("flow", {})
+            if flow.get("has_unusual_activity"):
+                headline = flow.get("headline", "")
+                if headline:
+                    bull_points.append(headline)
+                if flow.get("flow_sentiment") == item.get("bias", "").replace("call", "bullish").replace("put", "bearish"):
+                    bull_points.append(f"{item['ticker']} unusual options flow aligns with {item['bias']} bias (flow score {flow.get('flow_score', 0)}/100).")
             for bull_c in item.get("intelligence", {}).get("bull_catalysts", []):
                 bull_points.append(bull_c)
             if item.get("risk_notes"):
@@ -2270,6 +2512,7 @@ class ResearcherAgent:
             ("social", "Social proxy"),
             ("fundamentals", "SEC facts"),
             ("options", "Cboe options"),
+            ("flow", "Unusual options flow"),
         ]:
             payload = results.get(key, {})
             health.append({
@@ -2477,6 +2720,18 @@ class TraderAgent:
             "status": "pass" if 25 <= contract["dte"] <= 65 else "fail",
             "message": f"{contract['dte']} DTE",
         })
+        flow = watch.get("flow", {})
+        if flow.get("has_unusual_activity"):
+            flow_sentiment = flow.get("flow_sentiment", "neutral")
+            bias_match = (
+                (flow_sentiment == "bullish" and watch["bias"] == "call")
+                or (flow_sentiment == "bearish" and watch["bias"] == "put")
+            )
+            checks.append({
+                "name": "flow_alignment",
+                "status": "pass" if bias_match else "warn",
+                "message": f"Unusual flow is {flow_sentiment} (bias: {watch['bias']}), score {flow.get('flow_score', 0)}/100",
+            })
         regime = research_context.get("debate", {}).get("risk", {}).get("market_regime")
         checks.append({
             "name": "market_regime",

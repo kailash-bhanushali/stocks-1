@@ -478,8 +478,11 @@ function renderTrader(s) {
             const intelInfo = item.intelligence
                 ? `\n[Intelligence] ${item.intelligence.composite_signal?.toUpperCase() || 'NEUTRAL'} (${item.intelligence.intelligence_score ?? item.intelligence_score ?? 50}/100) · ${item.intelligence.insider_summary || 'SEC filings scanned'} · ${item.intelligence.seasonality_summary || ''}`
                 : '';
+            const flowInfo = item.flow?.has_unusual_activity
+                ? `\n[Unusual Flow] ${item.flow.flow_sentiment?.toUpperCase() || 'NEUTRAL'} (${item.flow.flow_score ?? item.flow_score ?? 0}/100) · ${item.flow.unusual_count || 0} unusual contract(s) · P/C ratio ${item.flow.put_call_ratio ?? '?'}`
+                : '';
 
-            row.title = `[Why Selected] ${selReason}\n[Score Breakdown] ${scoreBreak}\n[Options Detail] ${optInfo}${intelInfo}\n\n👉 Click row or '🧠 Intel' button to open Intelligence Drawer`;
+            row.title = `[Why Selected] ${selReason}\n[Score Breakdown] ${scoreBreak}\n[Options Detail] ${optInfo}${intelInfo}${flowInfo}\n\n👉 Click row or '🧠 Intel' button to open Intelligence Drawer`;
 
             wlEl.appendChild(row);
         });
