@@ -734,7 +734,9 @@ def fetch_seasonality(symbol: str) -> dict:
 def fetch_analyst_and_valuation(symbol: str) -> dict:
     """
     Scrapes Wall Street price targets, consensus ratings, short float %,
-    and core valuation multiples from Finviz.
+    core valuation multiples, upcoming earnings date, and recent analyst
+    upgrades / downgrades from Finviz.  All data comes from a single HTTP
+    request – zero extra network calls.
     """
     cached = _cache_get(symbol, "valuation")
     if cached:
@@ -752,6 +754,10 @@ def fetch_analyst_and_valuation(symbol: str) -> dict:
             "recommendation_label": "Buy",
             "short_float_pct": "—",
             "forward_pe": None,
+            "earnings_date": None,
+            "earnings_timing": None,
+            "earnings_days_away": None,
+            "analyst_actions": [],
             "summary": "Valuation metrics temporarily unavailable.",
             "as_of": datetime.now(timezone.utc).isoformat(),
         }
@@ -808,6 +814,58 @@ def fetch_analyst_and_valuation(symbol: str) -> dict:
     else:
         squeeze_risk = "Normal / Low Float Short"
 
+    # ── Earnings Date (IV Crush Shield) ───────────────────────
+    earnings_raw = m.get("Earnings", "").strip()
+    earnings_date = None
+    earnings_timing = None  # AMC = After Market Close, BMO = Before Market Open
+    earnings_days_away = None
+    if earnings_raw and earnings_raw != "-":
+        # Format: "Aug 03 AMC" or "Nov 04 BMO"
+        parts_e = earnings_raw.split()
+        timing_token = None
+        if len(parts_e) >= 3 and parts_e[-1] in ("AMC", "BMO"):
+            timing_token = parts_e[-1]
+            date_str = " ".join(parts_e[:-1])
+        else:
+            date_str = earnings_raw
+        try:
+            now = datetime.now(timezone.utc)
+            # Try parsing with current year first, then next year
+            for try_year in [now.year, now.year + 1]:
+                try:
+                    ed = datetime.strptime(f"{date_str} {try_year}", "%b %d %Y").replace(tzinfo=timezone.utc)
+                    if ed >= now - timedelta(days=7):  # allow up to 7 days in past
+                        earnings_date = ed.strftime("%Y-%m-%d")
+                        earnings_timing = timing_token
+                        earnings_days_away = (ed - now).days
+                        break
+                except ValueError:
+                    continue
+        except Exception:
+            pass
+
+    # ── Analyst Upgrades / Downgrades (from same page) ────────
+    analyst_actions = []
+    analyst_rows = re.findall(
+        r'<tr[^>]*class="styled-row[^"]*"[^>]*>(.*?)</tr>',
+        html, re.S
+    )
+    for row in analyst_rows[:10]:  # Cap at 10 most recent
+        cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.S)
+        cleaned = [re.sub(r'<[^<]+?>', '', c).replace('&rarr;', '→').strip() for c in cells]
+        if len(cleaned) >= 4:
+            analyst_actions.append({
+                "date": cleaned[0],
+                "action": cleaned[1],        # Upgrade, Downgrade, Initiated, Reiterated
+                "firm": cleaned[2],
+                "rating_change": cleaned[3],  # e.g. "Hold → Buy"
+                "target": cleaned[4] if len(cleaned) >= 5 else None,
+            })
+
+    # Count recent upgrade momentum (last 30 days)
+    recent_upgrades = sum(1 for a in analyst_actions if a["action"] in ("Upgrade", "Initiated") and "Buy" in a.get("rating_change", ""))
+    recent_downgrades = sum(1 for a in analyst_actions if a["action"] == "Downgrade")
+
     parts = []
     if target_price and target_upside_pct is not None:
         parts.append(f"Target: ${target_price:.2f} ({target_upside_pct:+.1f}% upside)")
@@ -817,6 +875,11 @@ def fetch_analyst_and_valuation(symbol: str) -> dict:
         parts.append(f"Short Float: {short_float} ({squeeze_risk})")
     if forward_pe:
         parts.append(f"Fwd P/E: {forward_pe:.1f}")
+    if earnings_date:
+        days_label = f"in {earnings_days_away}d" if earnings_days_away and earnings_days_away > 0 else "recent"
+        parts.append(f"Earnings: {earnings_date} {earnings_timing or ''} ({days_label})")
+    if recent_upgrades > 0:
+        parts.append(f"Analyst Upgrades: {recent_upgrades} recent")
 
     summary = " · ".join(parts) if parts else f"Wall Street Analyst metrics for {symbol}."
 
@@ -839,6 +902,12 @@ def fetch_analyst_and_valuation(symbol: str) -> dict:
         "profit_margin": profit_margin,
         "debt_to_equity": debt_equity,
         "market_cap": market_cap,
+        "earnings_date": earnings_date,
+        "earnings_timing": earnings_timing,
+        "earnings_days_away": earnings_days_away,
+        "analyst_actions": analyst_actions,
+        "recent_upgrades": recent_upgrades,
+        "recent_downgrades": recent_downgrades,
         "summary": summary,
         "as_of": datetime.now(timezone.utc).isoformat(),
     }
@@ -932,13 +1001,65 @@ def compute_intelligence_scoring(symbol: str, full_intel: dict) -> dict:
         if upside >= 15.0 and recom in ("Strong Buy", "Buy"):
             score += 8
             bull_catalysts.append(f"Wall St Target: ${val.get('target_price', 0):.2f} ({upside:+.1f}% upside, {recom})")
+        elif upside >= 5.0 and recom in ("Strong Buy", "Buy"):
+            score += 4
+            bull_catalysts.append(f"Wall St Target: ${val.get('target_price', 0):.2f} ({upside:+.1f}% upside, {recom})")
+        elif -5.0 <= upside < 0:
+            # Stock trading slightly above analyst consensus — mild caution
+            score -= 3
+            bear_catalysts.append(
+                f"At/Above Analyst Target: ${val.get('target_price', 0):.2f} ({upside:+.1f}%) — "
+                f"limited upside per Wall Street consensus"
+            )
+        elif -15.0 < upside < -5.0:
+            # Stock meaningfully above analyst target — stronger penalty
+            score -= 5
+            bear_catalysts.append(
+                f"Overextended vs Analyst Target: ${val.get('target_price', 0):.2f} ({upside:+.1f}%) — "
+                f"trading well above Wall Street consensus"
+            )
         elif upside <= -15.0:
-            score -= 6
-            bear_catalysts.append(f"Trades above Wall St Target (${val.get('target_price', 0):.2f}, {upside:+.1f}% downside)")
+            score -= 8
+            bear_catalysts.append(
+                f"Overbought vs Target: ${val.get('target_price', 0):.2f} ({upside:+.1f}%) — "
+                f"significantly above Wall Street consensus"
+            )
 
     if short_float >= 12.0:
         score += 5
         bull_catalysts.append(f"High Short Interest ({short_float:.1f}% float short): Short-squeeze catalyst potential")
+
+    # ── Earnings IV Crush Shield ──────────────────────────────
+    earnings_days = val.get("earnings_days_away")
+    earnings_date = val.get("earnings_date")
+    if earnings_days is not None and 0 <= earnings_days <= 7:
+        score -= 10
+        bear_catalysts.append(
+            f"⚠️ Earnings in {earnings_days}d ({earnings_date} {val.get('earnings_timing', '')}) — "
+            f"IV Crush risk: option premiums may collapse 40–60% post-earnings"
+        )
+    elif earnings_days is not None and 8 <= earnings_days <= 14:
+        bear_catalysts.append(
+            f"📅 Earnings approaching ({earnings_date}, {earnings_days}d away) — "
+            f"monitor IV levels before entry"
+        )
+
+    # ── Analyst Upgrade Momentum ──────────────────────────────
+    recent_ups = val.get("recent_upgrades", 0)
+    recent_downs = val.get("recent_downgrades", 0)
+    if recent_ups >= 2 and recent_downs == 0:
+        score += 6
+        bull_catalysts.append(f"Analyst Momentum: {recent_ups} recent upgrades with 0 downgrades")
+    elif recent_ups >= 1 and recent_ups > recent_downs:
+        score += 3
+        top_action = val.get("analyst_actions", [{}])[0]
+        bull_catalysts.append(
+            f"Analyst Upgrade: {top_action.get('firm', '?')} → {top_action.get('rating_change', '?')} "
+            f"(Target: {top_action.get('target', 'N/A')})"
+        )
+    elif recent_downs >= 2 and recent_ups == 0:
+        score -= 5
+        bear_catalysts.append(f"Analyst Downgrades: {recent_downs} recent downgrades with 0 upgrades")
 
     score = max(10, min(95, score))
 
@@ -960,4 +1081,7 @@ def compute_intelligence_scoring(symbol: str, full_intel: dict) -> dict:
         "ownership_summary": full_intel.get("ownership", {}).get("summary", ""),
         "seasonality_summary": seasonal.get("summary", ""),
         "valuation_summary": val.get("summary", ""),
+        "earnings_date": earnings_date,
+        "earnings_days_away": earnings_days,
+        "earnings_timing": val.get("earnings_timing"),
     }

@@ -1957,4 +1957,101 @@ button:disabled {
     color: #000;
 }
 
+/* ── Earnings Date Alert Banner ─────────────────────────────── */
+.earnings-alert {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 14px;
+    border-radius: 8px;
+    font-size: 0.82rem;
+    line-height: 1.4;
+    margin: 8px 0;
+}
+.earnings-alert-icon { font-size: 1.1rem; }
+.earnings-alert-safe {
+    background: rgba(100, 200, 120, 0.08);
+    border: 1px solid rgba(100, 200, 120, 0.15);
+    color: var(--fg);
+}
+.earnings-alert-warn {
+    background: rgba(255, 180, 0, 0.1);
+    border: 1px solid rgba(255, 180, 0, 0.25);
+    color: #f0c040;
+}
+.earnings-alert-danger {
+    background: rgba(255, 70, 70, 0.1);
+    border: 1px solid rgba(255, 70, 70, 0.3);
+    color: #ff6060;
+}
+.earnings-alert strong { font-weight: 700; }
+
+/* ── Analyst Actions Ledger ─────────────────────────────────── */
+.analyst-actions-section {
+    margin: 12px 0;
+}
+.analyst-actions-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 0.85rem;
+    margin-bottom: 6px;
+    color: var(--fg);
+}
+.analyst-momentum-badge {
+    font-size: 0.72rem;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-weight: 600;
+}
+.analyst-momentum-badge.bullish {
+    background: rgba(100, 200, 120, 0.12);
+    color: var(--green);
+}
+.analyst-momentum-badge.bearish {
+    background: rgba(255, 70, 70, 0.12);
+    color: var(--red);
+}
+.analyst-actions-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.78rem;
+}
+.analyst-actions-table th {
+    text-align: left;
+    padding: 5px 8px;
+    color: var(--muted);
+    font-weight: 500;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+.analyst-actions-table td {
+    padding: 5px 8px;
+    border-bottom: 1px solid rgba(255,255,255,0.03);
+    color: var(--fg);
+}
+.analyst-actions-table tr:hover td {
+    background: rgba(255,255,255,0.02);
+}
+.analyst-action-badge {
+    font-size: 0.7rem;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-weight: 600;
+}
+.analyst-action-badge.action-upgrade {
+    background: rgba(100, 200, 120, 0.12);
+    color: var(--green);
+}
+.analyst-action-badge.action-downgrade {
+    background: rgba(255, 70, 70, 0.12);
+    color: var(--red);
+}
+.analyst-action-badge.action-neutral {
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--muted);
+}
+
 

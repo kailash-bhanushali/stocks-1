@@ -1898,6 +1898,34 @@ function renderValuationPanel(d) {
     `;
     panel.appendChild(hero);
 
+    // ── Earnings Date Alert Banner ──────────────────────────────
+    if (d.earnings_date) {
+        const daysAway = d.earnings_days_away;
+        const timing = d.earnings_timing || '';
+        const timingLabel = timing === 'AMC' ? 'After Market Close' : timing === 'BMO' ? 'Before Market Open' : '';
+        let alertClass = 'earnings-alert-safe';
+        let alertIcon = '📅';
+        let alertMsg = `Next Earnings: ${escapeHtml(d.earnings_date)}`;
+        if (timingLabel) alertMsg += ` (${timingLabel})`;
+
+        if (daysAway != null && daysAway >= 0 && daysAway <= 7) {
+            alertClass = 'earnings-alert-danger';
+            alertIcon = '⚠️';
+            alertMsg += ` — <strong>${daysAway}d away!</strong> IV Crush risk: option premiums may collapse 40–60% post-earnings`;
+        } else if (daysAway != null && daysAway >= 8 && daysAway <= 14) {
+            alertClass = 'earnings-alert-warn';
+            alertIcon = '🔶';
+            alertMsg += ` — <strong>${daysAway}d away</strong> — monitor IV levels before entry`;
+        } else if (daysAway != null) {
+            alertMsg += ` — ${daysAway}d away (safe window)`;
+        }
+
+        const earningsEl = document.createElement('div');
+        earningsEl.className = `earnings-alert ${alertClass}`;
+        earningsEl.innerHTML = `<span class="earnings-alert-icon">${alertIcon}</span> ${alertMsg}`;
+        panel.appendChild(earningsEl);
+    }
+
     // Multiples & Short Float Grid
     const grid = document.createElement('div');
     grid.className = 'intel-val-grid';
@@ -1924,6 +1952,47 @@ function renderValuationPanel(d) {
         grid.appendChild(card);
     });
     panel.appendChild(grid);
+
+    // ── Analyst Actions Ledger ──────────────────────────────────
+    const actions = d.analyst_actions || [];
+    if (actions.length > 0) {
+        const actionsWrap = document.createElement('div');
+        actionsWrap.className = 'analyst-actions-section';
+
+        const upgrades = d.recent_upgrades || 0;
+        const downgrades = d.recent_downgrades || 0;
+        let momentumBadge = '';
+        if (upgrades > downgrades && upgrades >= 2) {
+            momentumBadge = `<span class="analyst-momentum-badge bullish">🟢 ${upgrades} Upgrades</span>`;
+        } else if (downgrades > upgrades && downgrades >= 2) {
+            momentumBadge = `<span class="analyst-momentum-badge bearish">🔴 ${downgrades} Downgrades</span>`;
+        }
+
+        let rows = '';
+        actions.slice(0, 6).forEach(a => {
+            const actionClass = (a.action === 'Upgrade' || a.action === 'Initiated') ? 'action-upgrade' :
+                                a.action === 'Downgrade' ? 'action-downgrade' : 'action-neutral';
+            rows += `<tr>
+                <td>${escapeHtml(a.date)}</td>
+                <td><span class="analyst-action-badge ${actionClass}">${escapeHtml(a.action)}</span></td>
+                <td>${escapeHtml(a.firm)}</td>
+                <td>${escapeHtml(a.rating_change)}</td>
+                <td>${escapeHtml(a.target || '—')}</td>
+            </tr>`;
+        });
+
+        actionsWrap.innerHTML = `
+            <div class="analyst-actions-header">
+                <strong>📊 Wall Street Analyst Actions</strong>
+                ${momentumBadge}
+            </div>
+            <table class="analyst-actions-table">
+                <thead><tr><th>Date</th><th>Action</th><th>Firm</th><th>Rating</th><th>Target</th></tr></thead>
+                <tbody>${rows}</tbody>
+            </table>
+        `;
+        panel.appendChild(actionsWrap);
+    }
 
     // Finviz Interactive Chart Box
     const chartBox = document.createElement('div');

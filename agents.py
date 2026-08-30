@@ -13,7 +13,7 @@ import xml.etree.ElementTree as ET
 
 import requests
 
-from intelligence_agent import compute_intelligence_scoring
+from intelligence_agent import compute_intelligence_scoring, fetch_all_intelligence
 from scoring_calibration import CalibrationError, calibrate as calibrate_scoring_weights
 
 from source_adapters import (
@@ -2092,7 +2092,7 @@ class ResearcherAgent:
         intel_by_symbol = {}
         if shortlisted:
             with ThreadPoolExecutor(max_workers=min(8, max(1, len(shortlisted)))) as pool:
-                future_to_sym = {pool.submit(compute_intelligence_scoring, item["ticker"]): item["ticker"] for item in shortlisted}
+                future_to_sym = {pool.submit(fetch_all_intelligence, item["ticker"]): item["ticker"] for item in shortlisted}
                 for future in as_completed(future_to_sym):
                     sym = future_to_sym[future]
                     try:
