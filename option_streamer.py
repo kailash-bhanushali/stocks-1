@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 import os
 import threading
-from typing import Dict, Iterable, Optional, Set
+from typing import Dict, Iterable, List, Optional, Set
 
 from dotenv import load_dotenv
 
@@ -43,7 +43,8 @@ class AlpacaOptionStream:
         self.started_at = None
         self.last_error = None
         self.last_status_change = utc_now()
-        self.target_symbols: Set[str] = set()
+        # Ordered by the latest Trader/watchlist score (best contract first).
+        self.target_symbols: List[str] = []
         self.subscribed_symbols: Set[str] = set()
         self.quotes: Dict[str, Dict] = {}
         self.sequence = 0
@@ -98,14 +99,25 @@ class AlpacaOptionStream:
         return self.snapshot()
 
     def set_symbols(self, symbols: Iterable[str]) -> Dict:
-        clean_symbols = {symbol for symbol in symbols if symbol}
+        clean_symbols = list(dict.fromkeys(symbol for symbol in symbols if symbol))
+        clean_set = set(clean_symbols)
         self.start()
         with self._lock:
+            targets_changed = clean_symbols != self.target_symbols
             self.target_symbols = clean_symbols
+            stale_quotes = set(self.quotes) - clean_set
+            if stale_quotes:
+                self.quotes = {
+                    symbol: self.quotes[symbol]
+                    for symbol in clean_symbols
+                    if symbol in self.quotes
+                }
+            if targets_changed or stale_quotes:
+                self.sequence += 1
             stream = self.stream
             current = set(self.subscribed_symbols)
-            to_unsubscribe = current - clean_symbols
-            to_subscribe = clean_symbols - current
+            to_unsubscribe = current - clean_set
+            to_subscribe = [symbol for symbol in clean_symbols if symbol not in current]
 
         if stream:
             if to_unsubscribe:
@@ -118,9 +130,9 @@ class AlpacaOptionStream:
                     self.subscribed_symbols -= to_unsubscribe
             if to_subscribe:
                 try:
-                    stream.subscribe_quotes(self._handle_quote, *sorted(to_subscribe))
+                    stream.subscribe_quotes(self._handle_quote, *to_subscribe)
                     with self._lock:
-                        self.subscribed_symbols |= to_subscribe
+                        self.subscribed_symbols.update(to_subscribe)
                         self.status = "running"
                         self.last_status_change = utc_now()
                 except Exception as exc:
@@ -159,7 +171,12 @@ class AlpacaOptionStream:
 
     def snapshot(self) -> Dict:
         with self._lock:
-            quotes = dict(sorted(self.quotes.items()))
+            # Only expose contracts from the latest scan, in Trader score order.
+            quotes = {
+                symbol: dict(self.quotes[symbol])
+                for symbol in self.target_symbols
+                if symbol in self.quotes
+            }
             latest = sorted(
                 quotes.values(),
                 key=lambda item: item.get("received_at") or "",
@@ -189,8 +206,11 @@ class AlpacaOptionStream:
                 "started_at": self.started_at,
                 "last_status_change": self.last_status_change,
                 "last_error": self.last_error,
-                "target_symbols": sorted(self.target_symbols),
-                "subscribed_symbols": sorted(self.subscribed_symbols),
+                "target_symbols": list(self.target_symbols),
+                "subscribed_symbols": [
+                    symbol for symbol in self.target_symbols
+                    if symbol in self.subscribed_symbols
+                ],
                 "subscribed_count": subscribed_count,
                 "quote_count": len(quotes),
                 "stream_quote_count": stream_quote_count,
@@ -231,6 +251,8 @@ class AlpacaOptionStream:
         mid = (bid + ask) / 2 if bid is not None and ask is not None else None
         timestamp = getattr(data, "timestamp", None)
         with self._lock:
+            if symbol not in self.target_symbols:
+                return
             self.quotes[symbol] = {
                 "symbol": symbol,
                 "bid": safe_round(bid),

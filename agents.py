@@ -1,15 +1,29 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import copy
 from datetime import date, datetime, timedelta, timezone
 import json
 import math
 import os
 import re
 import statistics
+import threading
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 
 import requests
+
+from intelligence_agent import compute_intelligence_scoring
+from scoring_calibration import CalibrationError, calibrate as calibrate_scoring_weights
+
+from source_adapters import (
+    CustomSourceRequestError,
+    CustomSourceValidationError,
+    GenericJsonSource,
+    contracts_for_ui,
+    credential_state as custom_credential_state,
+    validate_custom_source,
+)
 
 try:
     from alpaca.data.enums import DataFeed, MarketType, MostActivesBy, OptionsFeed
@@ -48,6 +62,525 @@ NEGATIVE_WORDS = {
     "weak", "probe", "lawsuit", "warning", "layoff", "loss", "losses", "bearish",
     "underperform", "recall", "delay", "risk", "slump"
 }
+
+SOURCE_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "runtime", "sources_config.json")
+SOURCE_CONFIG_LOCK = threading.RLock()
+
+LEGACY_SCORING_PROVENANCE = {
+    "status": "legacy_unvalidated",
+    "method": "Hand-tuned heuristic inherited from the original repository",
+    "origin": "No experiment, backtest, or statistical fit was recorded for these defaults.",
+    "target": None,
+    "generated_at": None,
+    "metrics": {},
+    "limitations": [
+        "The default coefficients are starting assumptions, not evidence of predictive performance.",
+        "Use Calibrate & Apply to fit the weights on point-in-time historical bars and inspect holdout metrics.",
+    ],
+}
+
+
+def _field(label, field_type, help_text, **constraints):
+    return {"label": label, "type": field_type, "help": help_text, **constraints}
+
+
+DEFAULT_SOURCES_CONFIG = {
+    "discovery": {
+        "title": "Discovery: sectors, ETFs, and movers",
+        "description": "Ranks configured sector ETFs with Yahoo daily bars, then optionally adds Alpaca top movers and most-active symbols. Changes apply to the next scan without restarting the server.",
+        "source_inventory": [
+            {"id": "yahoo_chart", "label": "Yahoo Finance Chart", "purpose": "ETF price, return, and volume momentum", "endpoint_field": "yahoo_chart_endpoint"},
+            {"id": "alpaca_screener", "label": "Alpaca Screener", "purpose": "US stock movers and most-active symbols", "credential_env": ["ALPACA_API_KEY", "ALPACA_SECRET_KEY"]},
+        ],
+        "custom_sources": [],
+        "enabled_sources": ["yahoo_chart", "alpaca_screener"],
+        "sector_etfs": [
+            "XLK:Technology", "XLF:Financials", "XLE:Energy", "XLV:Healthcare",
+            "XLI:Industrials", "XLC:Communication", "XLRE:Real Estate", "XLB:Materials",
+            "XLP:Consumer Staples", "XLU:Utilities", "XLY:Consumer Discretionary",
+            "SMH:Technology", "SOXX:Technology", "CIBR:Technology", "IGV:Technology",
+            "IBB:Healthcare", "URA:Energy", "GRID:Utilities", "KRE:Financials",
+        ],
+        "benchmark_lookback_range": "3mo",
+        "chart_interval": "1d",
+        "top_sectors_count": 5,
+        "minimum_sectors_count": 3,
+        "minimum_momentum_score": -5.0,
+        "weight_5d_return": 2.0,
+        "weight_20d_return": 1.5,
+        "weight_volume_expansion": 10.0,
+        "calibration_lookback_range": "2y",
+        "calibration_target_days": 5,
+        "calibration_ridge_penalty": 5.0,
+        "scoring_provenance": copy.deepcopy(LEGACY_SCORING_PROVENANCE),
+        "alpaca_movers_count": 10,
+        "alpaca_actives_count": 10,
+        "alpaca_extra_limit": 15,
+        "request_timeout_seconds": 12,
+        "yahoo_chart_endpoint": "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+        "field_schema": {
+            "custom_sources": _field("Custom discovery sources", "source_list", "Managed through Add Source.", hidden=True),
+            "enabled_sources": _field("Enabled discovery sources", "list", "Comma-separated source IDs. Yahoo provides ETF momentum; Alpaca adds movers. Allowed: yahoo_chart, alpaca_screener.", choices=["yahoo_chart", "alpaca_screener"]),
+            "sector_etfs": _field("Sector ETFs", "list", "Comma-separated TICKER:Sector entries. New ETFs may be added; ticker-only entries are grouped under Custom.", min_items=1, max_items=100),
+            "benchmark_lookback_range": _field("ETF chart lookback", "text", "Yahoo range such as 1mo, 3mo, 6mo, 1y, or 2y.", placeholder="3mo"),
+            "chart_interval": _field("ETF bar interval", "text", "Yahoo interval such as 1d or 1wk. Daily bars are expected by the momentum calculation.", placeholder="1d"),
+            "top_sectors_count": _field("Maximum active sectors", "integer", "Highest-ranked sectors allowed into theme discovery.", min=1, max=20),
+            "minimum_sectors_count": _field("Minimum active sectors", "integer", "Always retain at least this many sectors, even when momentum is below the cutoff.", min=1, max=20),
+            "minimum_momentum_score": _field("Momentum cutoff", "number", "A sector above this score can be selected after the minimum count is satisfied.", min=-100, max=100),
+            "weight_5d_return": _field("5-day return weight", "number", "Score points per 1 percentage point of 5-day ETF return.", min=-20, max=20, origin="Legacy hand-tuned default; no recorded empirical basis until calibrated."),
+            "weight_20d_return": _field("20-day return weight", "number", "Score points per 1 percentage point of 20-day ETF return.", min=-20, max=20, origin="Legacy hand-tuned default; no recorded empirical basis until calibrated."),
+            "weight_volume_expansion": _field("Volume-expansion weight", "number", "Score points per 1.0 of volume ratio above its 20-day average; below-average volume adds zero.", min=-100, max=100, origin="Legacy hand-tuned default; no recorded empirical basis until calibrated."),
+            "calibration_lookback_range": _field("Calibration history", "text", "Yahoo range used when fitting score weights, such as 1y, 2y, or 5y. Use at least 2y for a useful holdout.", placeholder="2y"),
+            "calibration_target_days": _field("Calibration target horizon", "integer", "Forward trading-day return the regression tries to predict.", min=1, max=20),
+            "calibration_ridge_penalty": _field("Calibration regularization", "number", "Ridge penalty that reduces unstable coefficients; larger values shrink weights more.", min=0.01, max=1000),
+            "scoring_provenance": _field("Scoring provenance", "object", "Generated calibration evidence shown in the scoring explanation card.", hidden=True),
+            "alpaca_movers_count": _field("Alpaca movers requested", "integer", "Number requested from Alpaca's market-movers screener.", min=1, max=50),
+            "alpaca_actives_count": _field("Alpaca most-active requested", "integer", "Number requested from Alpaca's volume screener.", min=1, max=50),
+            "alpaca_extra_limit": _field("Extra mover symbol limit", "integer", "Maximum unique Alpaca symbols added outside configured themes.", min=0, max=50),
+            "request_timeout_seconds": _field("HTTP timeout (seconds)", "number", "Per-request timeout for Yahoo ETF charts.", min=2, max=60),
+            "yahoo_chart_endpoint": _field("Yahoo chart endpoint", "url", "Full HTTP(S) URL template. It must contain {symbol}; range and interval are sent as query parameters.", placeholder="https://.../{symbol}"),
+        },
+    },
+    "market": {
+        "title": "Market: technical bars and live quote router",
+        "description": "Builds technical metrics from Yahoo bars. After watchlist selection, the read-only quote router checks enabled Alpaca, Cboe, Finnhub, Alpha Vantage, and Massive sources.",
+        "source_inventory": [
+            {"id": "yahoo_chart", "label": "Yahoo Finance Chart", "purpose": "Historical bars used for price, volume, SMA, RSI, and returns", "endpoint_field": "yahoo_chart_endpoint"},
+            {"id": "alpaca", "label": "Alpaca Market Data", "purpose": "Stock and selected-option snapshots", "credential_env": ["ALPACA_API_KEY", "ALPACA_SECRET_KEY"]},
+            {"id": "cboe", "label": "Cboe Delayed Options", "purpose": "Option-chain liquidity validation and delayed selected-option quotes", "endpoint_field": "cboe_endpoint"},
+            {"id": "finnhub", "label": "Finnhub", "purpose": "Underlying stock quote fallback", "credential_env": ["FINNHUB_API_KEY"], "endpoint_field": "finnhub_quote_endpoint"},
+            {"id": "alpha_vantage", "label": "Alpha Vantage", "purpose": "Underlying stock quote fallback", "credential_env": ["ALPHA_VANTAGE_API_KEY"], "endpoint_field": "alpha_vantage_endpoint"},
+            {"id": "massive", "label": "Massive / Polygon", "purpose": "Underlying stock snapshot fallback", "credential_env": ["MASSIVE_API_KEY|POLYGON_API_KEY"], "endpoint_field": "massive_endpoint"},
+        ],
+        "custom_sources": [],
+        "enabled_sources": ["yahoo_chart", "alpaca", "cboe", "finnhub", "alpha_vantage", "massive"],
+        "benchmark_symbols": ["SPY", "QQQ", "IWM", "DIA"],
+        "chart_lookback_range": "6mo",
+        "chart_interval": "1d",
+        "sma_short_days": 20,
+        "sma_long_days": 50,
+        "rsi_days": 14,
+        "minimum_volume_ratio": 1.2,
+        "overbought_rsi": 75.0,
+        "weight_5d_return": 1.2,
+        "weight_20d_return": 1.5,
+        "weight_60d_return": 0.8,
+        "sma_short_bonus": 8.0,
+        "sma_long_bonus": 8.0,
+        "weight_volume_expansion": 8.0,
+        "volume_bonus_cap": 8.0,
+        "overbought_penalty": 8.0,
+        "calibration_symbols": ["SPY", "QQQ", "IWM", "DIA", "XLK", "XLF", "XLE", "XLV", "XLI", "XLY"],
+        "calibration_lookback_range": "2y",
+        "calibration_target_days": 5,
+        "calibration_ridge_penalty": 5.0,
+        "scoring_provenance": copy.deepcopy(LEGACY_SCORING_PROVENANCE),
+        "max_parallel_requests": 8,
+        "request_timeout_seconds": 12,
+        "max_quote_symbols": 8,
+        "max_quote_contracts": 8,
+        "yahoo_chart_endpoint": "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+        "finnhub_quote_endpoint": "https://finnhub.io/api/v1/quote",
+        "alpha_vantage_endpoint": "https://www.alphavantage.co/query",
+        "massive_endpoint": "https://api.massive.com/v2/snapshot/locale/us/markets/stocks/tickers/{symbol}",
+        "cboe_endpoint": "https://cdn.cboe.com/api/global/delayed_quotes/options/{underlying}.json",
+        "field_schema": {
+            "custom_sources": _field("Custom market sources", "source_list", "Managed through Add Source.", hidden=True),
+            "enabled_sources": _field("Enabled market sources", "list", "Comma-separated source IDs. yahoo_chart is the technical-bar source; the others are live quote-router fallbacks.", choices=["yahoo_chart", "alpaca", "cboe", "finnhub", "alpha_vantage", "massive"]),
+            "benchmark_symbols": _field("Benchmark symbols", "list", "Symbols always added to the technical scan for market-regime and relative-strength comparisons.", min_items=1, max_items=20),
+            "chart_lookback_range": _field("Technical chart lookback", "text", "Yahoo range. It must provide enough bars for the long SMA and 60-day return.", placeholder="6mo"),
+            "chart_interval": _field("Technical bar interval", "text", "Yahoo interval; use 1d for the day-based calculations shown in the UI.", placeholder="1d"),
+            "sma_short_days": _field("Short SMA days", "integer", "Number of most recent closes in the short simple moving average.", min=2, max=250),
+            "sma_long_days": _field("Long SMA days", "integer", "Number of most recent closes in the long simple moving average.", min=3, max=500),
+            "rsi_days": _field("RSI period", "integer", "Number of daily changes used in RSI.", min=2, max=100),
+            "minimum_volume_ratio": _field("Volume surge threshold", "number", "Latest volume divided by prior average. Example: 1.2 means 20% above average.", min=0, max=20),
+            "overbought_rsi": _field("Overbought RSI cutoff", "number", "RSI above this level receives the configured penalty.", min=1, max=100),
+            "weight_5d_return": _field("5-day return weight", "number", "Score points per 1 percentage point of 5-day return.", min=-20, max=20, origin="Legacy hand-tuned default; no recorded empirical basis until calibrated."),
+            "weight_20d_return": _field("20-day return weight", "number", "Score points per 1 percentage point of 20-day return.", min=-20, max=20, origin="Legacy hand-tuned default; no recorded empirical basis until calibrated."),
+            "weight_60d_return": _field("60-day return weight", "number", "Score points per 1 percentage point of 60-day return.", min=-20, max=20, origin="Legacy hand-tuned default; no recorded empirical basis until calibrated."),
+            "sma_short_bonus": _field("Above-short-SMA bonus", "number", "Points added when price is above the configured short SMA.", min=-50, max=50, origin="Legacy hand-tuned default; calibration treats this as a binary feature."),
+            "sma_long_bonus": _field("Above-long-SMA bonus", "number", "Points added when price is above the configured long SMA.", min=-50, max=50, origin="Legacy hand-tuned default; calibration treats this as a binary feature."),
+            "weight_volume_expansion": _field("Volume-expansion weight", "number", "Points per 1.0 of volume ratio above the surge threshold, before the cap.", min=-100, max=100, origin="Legacy hand-tuned default; calibration fits volume expansion as a continuous feature."),
+            "volume_bonus_cap": _field("Volume bonus cap", "number", "Maximum points added for volume above the configured threshold.", min=0, max=50),
+            "overbought_penalty": _field("Overbought penalty", "number", "Points removed when RSI exceeds the cutoff.", min=0, max=50, origin="Legacy hand-tuned default; calibration treats overbought as a binary feature."),
+            "calibration_symbols": _field("Calibration symbols", "list", "Comma-separated liquid benchmarks and sector ETFs used to fit and validate market weights.", min_items=4, max_items=50),
+            "calibration_lookback_range": _field("Calibration history", "text", "Yahoo range used when fitting score weights, such as 1y, 2y, or 5y.", placeholder="2y"),
+            "calibration_target_days": _field("Calibration target horizon", "integer", "Forward trading-day return the regression tries to predict.", min=1, max=20),
+            "calibration_ridge_penalty": _field("Calibration regularization", "number", "Ridge penalty that reduces unstable coefficients; larger values shrink weights more.", min=0.01, max=1000),
+            "scoring_provenance": _field("Scoring provenance", "object", "Generated calibration evidence shown in the scoring explanation card.", hidden=True),
+            "max_parallel_requests": _field("Parallel chart requests", "integer", "Maximum concurrent Yahoo bar requests.", min=1, max=32),
+            "request_timeout_seconds": _field("HTTP timeout (seconds)", "number", "Per-request timeout for chart and quote HTTP calls.", min=2, max=60),
+            "max_quote_symbols": _field("Live underlying quote limit", "integer", "Maximum watchlist underlyings sent to the live quote router.", min=1, max=50),
+            "max_quote_contracts": _field("Live option quote limit", "integer", "Maximum selected option contracts sent to the live quote router.", min=1, max=50),
+            "yahoo_chart_endpoint": _field("Yahoo chart endpoint", "url", "HTTP(S) URL template containing {symbol}.", placeholder="https://.../{symbol}"),
+            "finnhub_quote_endpoint": _field("Finnhub quote endpoint", "url", "HTTP(S) quote endpoint; symbol and token are query parameters."),
+            "alpha_vantage_endpoint": _field("Alpha Vantage endpoint", "url", "HTTP(S) query endpoint; function, symbol, and API key are query parameters."),
+            "massive_endpoint": _field("Massive snapshot endpoint", "url", "HTTP(S) URL template containing {symbol}."),
+            "cboe_endpoint": _field("Cboe options endpoint", "url", "HTTP(S) URL template containing {underlying}."),
+        },
+    },
+    "news": {
+        "title": "News: catalysts and headline sentiment",
+        "description": "Searches each active theme on enabled endpoints, de-duplicates headlines, and scores configurable positive and negative terms.",
+        "source_inventory": [
+            {"id": "yahoo_search", "label": "Yahoo Finance Search", "purpose": "Theme and ticker headline search", "endpoint_field": "yahoo_search_endpoint"},
+            {"id": "finnhub_company_news", "label": "Finnhub Company News", "purpose": "Recent company headlines for leading theme tickers", "credential_env": ["FINNHUB_API_KEY"], "endpoint_field": "finnhub_company_news_endpoint"},
+        ],
+        "custom_sources": [],
+        "enabled_sources": ["yahoo_search"],
+        "articles_per_theme": 6,
+        "query_ticker_count": 3,
+        "finnhub_days_back": 7,
+        "request_timeout_seconds": 12,
+        "sentiment_word_weight": 8.0,
+        "positive_keywords": sorted(POSITIVE_WORDS),
+        "negative_keywords": sorted(NEGATIVE_WORDS),
+        "yahoo_search_endpoint": "https://query1.finance.yahoo.com/v1/finance/search",
+        "finnhub_company_news_endpoint": "https://finnhub.io/api/v1/company-news",
+        "field_schema": {
+            "custom_sources": _field("Custom news sources", "source_list", "Managed through Add Source.", hidden=True),
+            "enabled_sources": _field("Enabled news sources", "list", "Comma-separated source IDs. Finnhub requires FINNHUB_API_KEY in .env.", choices=["yahoo_search", "finnhub_company_news"]),
+            "articles_per_theme": _field("Articles retained per theme", "integer", "Maximum de-duplicated headlines retained and scored for each active theme.", min=1, max=50),
+            "query_ticker_count": _field("Tickers included per query", "integer", "Number of leading theme tickers included in Yahoo search and queried individually on Finnhub.", min=1, max=10),
+            "finnhub_days_back": _field("Finnhub history days", "integer", "Calendar days included in each Finnhub company-news request.", min=1, max=365),
+            "request_timeout_seconds": _field("HTTP timeout (seconds)", "number", "Per-request timeout for news endpoints.", min=2, max=60),
+            "sentiment_word_weight": _field("Sentiment points per keyword", "number", "Points added per positive token and removed per negative token from a neutral score of 50.", min=0, max=25),
+            "positive_keywords": _field("Positive sentiment keywords", "list", "Comma-separated lowercase words counted as positive. Add or remove terms to tune headline scoring.", min_items=0, max_items=250),
+            "negative_keywords": _field("Negative sentiment keywords", "list", "Comma-separated lowercase words counted as negative. Add or remove terms to tune headline scoring.", min_items=0, max_items=250),
+            "yahoo_search_endpoint": _field("Yahoo news-search endpoint", "url", "HTTP(S) endpoint; q, newsCount, and quotesCount are sent as query parameters."),
+            "finnhub_company_news_endpoint": _field("Finnhub company-news endpoint", "url", "HTTP(S) endpoint; symbol, from, to, and token are sent as query parameters."),
+        },
+    },
+    "social": {
+        "title": "Social: Reddit and Hacker News discussion",
+        "description": "Searches the configured Reddit communities and Hacker News for each active theme, de-duplicates posts, and applies its own sentiment dictionary.",
+        "source_inventory": [
+            {"id": "reddit_rss", "label": "Reddit RSS", "purpose": "New posts in configured investing communities", "endpoint_field": "reddit_rss_endpoint"},
+            {"id": "hackernews", "label": "Hacker News Algolia", "purpose": "Technology and market discussion search", "endpoint_field": "hackernews_endpoint"},
+        ],
+        "custom_sources": [],
+        "enabled_sources": ["reddit_rss", "hackernews"],
+        "subreddits": ["options", "stocks", "wallstreetbets"],
+        "hackernews_terms": ["trading", "stocks", "market", "options", "ai"],
+        "query_ticker_count": 2,
+        "items_per_source": 5,
+        "items_per_theme": 8,
+        "reddit_sort": "new",
+        "reddit_time_window": "week",
+        "request_timeout_seconds": 12,
+        "sentiment_word_weight": 8.0,
+        "positive_keywords": sorted(POSITIVE_WORDS),
+        "negative_keywords": sorted(NEGATIVE_WORDS),
+        "reddit_rss_endpoint": "https://www.reddit.com/r/{subreddits}/search.rss",
+        "hackernews_endpoint": "https://hn.algolia.com/api/v1/search",
+        "field_schema": {
+            "custom_sources": _field("Custom social sources", "source_list", "Managed through Add Source.", hidden=True),
+            "enabled_sources": _field("Enabled social sources", "list", "Comma-separated source IDs: reddit_rss and/or hackernews.", choices=["reddit_rss", "hackernews"]),
+            "subreddits": _field("Subreddits", "list", "Comma-separated subreddit names without r/. They are combined into one restricted RSS search.", min_items=0, max_items=50),
+            "hackernews_terms": _field("Hacker News context terms", "list", "Extra terms appended to each active-theme query. Keep this short to avoid over-restricting results.", min_items=0, max_items=25),
+            "query_ticker_count": _field("Tickers included per query", "integer", "Number of theme tickers appended to each social query.", min=0, max=10),
+            "items_per_source": _field("Items requested per source", "integer", "Maximum Reddit entries and Hacker News hits read for each theme/source.", min=1, max=50),
+            "items_per_theme": _field("Items retained per theme", "integer", "Maximum de-duplicated social items retained and scored per theme.", min=1, max=100),
+            "reddit_sort": _field("Reddit sort", "text", "Reddit search sort such as new, relevance, top, or comments.", placeholder="new"),
+            "reddit_time_window": _field("Reddit time window", "text", "Reddit t value such as hour, day, week, month, year, or all.", placeholder="week"),
+            "request_timeout_seconds": _field("HTTP timeout (seconds)", "number", "Per-request timeout for social endpoints.", min=2, max=60),
+            "sentiment_word_weight": _field("Sentiment points per keyword", "number", "Points added or removed per configured keyword from a neutral score of 50.", min=0, max=25),
+            "positive_keywords": _field("Positive sentiment keywords", "list", "Comma-separated lowercase positive tokens.", min_items=0, max_items=250),
+            "negative_keywords": _field("Negative sentiment keywords", "list", "Comma-separated lowercase negative tokens.", min_items=0, max_items=250),
+            "reddit_rss_endpoint": _field("Reddit RSS endpoint", "url", "HTTP(S) URL template containing {subreddits}. Use {subreddits} for the plus-separated community list."),
+            "hackernews_endpoint": _field("Hacker News endpoint", "url", "HTTP(S) Algolia search endpoint; query, tags, and hitsPerPage are query parameters."),
+        },
+    },
+    "fundamentals": {
+        "title": "Fundamentals: SEC XBRL company facts",
+        "description": "Maps tickers to SEC CIKs, reads annual USD XBRL facts, calculates revenue and net-income YoY growth, and converts those values into a configurable 0–100 score.",
+        "source_inventory": [
+            {"id": "sec_companyfacts", "label": "SEC EDGAR Company Facts", "purpose": "Official CIK mapping and us-gaap annual facts", "endpoint_field": "sec_companyfacts_endpoint"},
+        ],
+        "custom_sources": [],
+        "enabled_sources": ["sec_companyfacts"],
+        "max_symbols": 14,
+        "request_timeout_seconds": 12,
+        "fiscal_period": "FY",
+        "currency_unit": "USD",
+        "minimum_history_years": 2,
+        "minimum_revenue_yoy_pct": 10.0,
+        "base_score": 50.0,
+        "revenue_growth_weight": 1.0,
+        "revenue_contribution_cap": 25.0,
+        "net_income_growth_weight": 0.5,
+        "net_income_contribution_cap": 20.0,
+        "final_watchlist_weight": 0.13,
+        "revenue_tags": ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "SalesRevenueNet"],
+        "net_income_tags": ["NetIncomeLoss"],
+        "sec_ticker_map_endpoint": "https://www.sec.gov/files/company_tickers.json",
+        "sec_companyfacts_endpoint": "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json",
+        "field_schema": {
+            "custom_sources": _field("Custom fundamental sources", "source_list", "Managed through Add Source.", hidden=True),
+            "enabled_sources": _field("Enabled fundamental sources", "list", "The implemented source ID is sec_companyfacts. Empty disables the fundamental lookup.", choices=["sec_companyfacts"]),
+            "max_symbols": _field("Maximum companies per scan", "integer", "Top preliminary candidates sent to SEC fundamentals and options deep checks.", min=1, max=100),
+            "request_timeout_seconds": _field("HTTP timeout (seconds)", "number", "Per-request timeout for SEC ticker-map and company-facts calls.", min=2, max=60),
+            "fiscal_period": _field("Fiscal period", "text", "SEC XBRL fp value used to select observations. FY means annual filings.", placeholder="FY"),
+            "currency_unit": _field("XBRL currency unit", "text", "Unit key read from SEC facts, normally USD.", placeholder="USD"),
+            "minimum_history_years": _field("Minimum annual history", "integer", "At least this many unique fiscal years are required to calculate YoY growth.", min=2, max=20),
+            "minimum_revenue_yoy_pct": _field("Revenue-growth benchmark (%)", "number", "Shown as a pass/fail benchmark in each company result; it is not a hard exclusion filter.", min=-100, max=1000),
+            "base_score": _field("Base fundamental score", "number", "Neutral starting score before revenue and income growth contributions.", min=0, max=100),
+            "revenue_growth_weight": _field("Revenue growth weight", "number", "Revenue YoY percentage is multiplied by this value before clipping.", min=-10, max=10),
+            "revenue_contribution_cap": _field("Revenue contribution cap", "number", "Maximum absolute points revenue growth can add or remove.", min=0, max=100),
+            "net_income_growth_weight": _field("Net-income growth weight", "number", "Net-income YoY percentage is multiplied by this value before clipping.", min=-10, max=10),
+            "net_income_contribution_cap": _field("Net-income contribution cap", "number", "Maximum absolute points net-income growth can add or remove.", min=0, max=100),
+            "final_watchlist_weight": _field("Final-score fundamental weight", "number", "Weight assigned to the 0–100 fundamental score in final watchlist ranking.", min=0, max=1),
+            "revenue_tags": _field("Revenue XBRL tags", "list", "Tags are tried in order; the first one with enough annual history is used.", min_items=1, max_items=50),
+            "net_income_tags": _field("Net-income XBRL tags", "list", "Tags are tried in order; the first one with enough annual history is used.", min_items=1, max_items=50),
+            "sec_ticker_map_endpoint": _field("SEC ticker-map endpoint", "url", "HTTP(S) JSON endpoint mapping stock tickers to CIK values."),
+            "sec_companyfacts_endpoint": _field("SEC company-facts endpoint", "url", "HTTP(S) URL template containing {cik}; the code supplies a zero-padded 10-digit CIK."),
+        },
+    },
+}
+
+
+class SourcesConfigValidationError(ValueError):
+    pass
+
+
+def _validate_config_value(section_key, field_key, value, meta):
+    field_type = meta.get("type", "text")
+    label = f"{section_key}.{field_key}"
+    if field_type == "object":
+        if not isinstance(value, dict):
+            raise SourcesConfigValidationError(f"{label} must be an object")
+        return copy.deepcopy(value)
+    if field_type == "source_list":
+        if not isinstance(value, list):
+            raise SourcesConfigValidationError(f"{label} must be a list of source definitions")
+        if len(value) > 20:
+            raise SourcesConfigValidationError(f"{label} supports at most 20 custom sources")
+        built_in_ids = [source["id"] for source in DEFAULT_SOURCES_CONFIG[section_key]["source_inventory"]]
+        validated = []
+        seen = set()
+        for source in value:
+            try:
+                item = validate_custom_source(section_key, source, built_in_ids)
+            except CustomSourceValidationError as exc:
+                raise SourcesConfigValidationError(str(exc)) from exc
+            if item["id"] in seen:
+                raise SourcesConfigValidationError(f"Duplicate custom source ID: {item['id']}")
+            seen.add(item["id"])
+            validated.append(item)
+        return validated
+    if field_type == "list":
+        if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+            raise SourcesConfigValidationError(f"{label} must be a list of text values")
+        value = [item.strip() for item in value if item.strip()]
+        if len(value) < meta.get("min_items", 0) or len(value) > meta.get("max_items", 1000):
+            raise SourcesConfigValidationError(f"{label} has an invalid number of entries")
+        choices = meta.get("choices")
+        if choices and any(item not in choices for item in value):
+            raise SourcesConfigValidationError(f"{label} contains an unsupported source ID")
+        return value
+    if field_type in ("number", "integer"):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            raise SourcesConfigValidationError(f"{label} must be a finite number")
+        value = int(value) if field_type == "integer" else float(value)
+        if value < meta.get("min", value) or value > meta.get("max", value):
+            raise SourcesConfigValidationError(f"{label} must be between {meta.get('min')} and {meta.get('max')}")
+        return value
+    if not isinstance(value, str):
+        raise SourcesConfigValidationError(f"{label} must be text")
+    value = value.strip()
+    if field_type == "url":
+        parsed = urllib.parse.urlparse(value)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise SourcesConfigValidationError(f"{label} must be a full HTTP(S) URL")
+    return value
+
+
+def _merge_sources_config(base_config, new_config):
+    if not isinstance(new_config, dict):
+        raise SourcesConfigValidationError("Configuration payload must be an object")
+    merged = copy.deepcopy(base_config)
+    for section_key, section_update in new_config.items():
+        if section_key not in merged:
+            raise SourcesConfigValidationError(f"Unknown configuration section: {section_key}")
+        if not isinstance(section_update, dict):
+            raise SourcesConfigValidationError(f"{section_key} must be an object")
+        schema = merged[section_key]["field_schema"]
+        for field_key, value in section_update.items():
+            if field_key not in schema:
+                raise SourcesConfigValidationError(f"Unknown configuration field: {section_key}.{field_key}")
+            merged[section_key][field_key] = _validate_config_value(section_key, field_key, value, schema[field_key])
+    discovery = merged["discovery"]
+    if discovery["minimum_sectors_count"] > discovery["top_sectors_count"]:
+        raise SourcesConfigValidationError("discovery.minimum_sectors_count cannot exceed top_sectors_count")
+    market = merged["market"]
+    if market["sma_short_days"] >= market["sma_long_days"]:
+        raise SourcesConfigValidationError("market.sma_short_days must be lower than sma_long_days")
+    required_templates = [
+        ("discovery", "yahoo_chart_endpoint", "{symbol}"),
+        ("market", "yahoo_chart_endpoint", "{symbol}"),
+        ("market", "massive_endpoint", "{symbol}"),
+        ("market", "cboe_endpoint", "{underlying}"),
+        ("social", "reddit_rss_endpoint", "{subreddits}"),
+        ("fundamentals", "sec_companyfacts_endpoint", "{cik}"),
+    ]
+    for section_key, field_key, token in required_templates:
+        if token not in merged[section_key][field_key]:
+            raise SourcesConfigValidationError(f"{section_key}.{field_key} must contain {token}")
+    for entry in discovery["sector_etfs"]:
+        ticker = entry.partition(":")[0].strip().upper()
+        if not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", ticker):
+            raise SourcesConfigValidationError(f"Invalid discovery ETF ticker: {ticker or entry}")
+    market["benchmark_symbols"] = [symbol.upper() for symbol in market["benchmark_symbols"]]
+    market["calibration_symbols"] = [symbol.upper() for symbol in market["calibration_symbols"]]
+    for symbol in market["benchmark_symbols"] + market["calibration_symbols"]:
+        if not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", symbol):
+            raise SourcesConfigValidationError(f"Invalid market symbol: {symbol}")
+    for subreddit in merged["social"]["subreddits"]:
+        if not re.fullmatch(r"[A-Za-z0-9_]{1,50}", subreddit.replace("r/", "")):
+            raise SourcesConfigValidationError(f"Invalid subreddit name: {subreddit}")
+    for section_key in ("news", "social"):
+        merged[section_key]["positive_keywords"] = [word.lower() for word in merged[section_key]["positive_keywords"]]
+        merged[section_key]["negative_keywords"] = [word.lower() for word in merged[section_key]["negative_keywords"]]
+    return merged
+
+
+def _load_sources_config():
+    try:
+        with open(SOURCE_CONFIG_PATH, "r", encoding="utf-8") as handle:
+            stored = json.load(handle)
+        return _merge_sources_config(DEFAULT_SOURCES_CONFIG, stored)
+    except FileNotFoundError:
+        return copy.deepcopy(DEFAULT_SOURCES_CONFIG)
+    except Exception:
+        return copy.deepcopy(DEFAULT_SOURCES_CONFIG)
+
+
+def _persist_sources_config(config):
+    os.makedirs(os.path.dirname(SOURCE_CONFIG_PATH), exist_ok=True)
+    values_only = {}
+    for section_key, section in config.items():
+        values_only[section_key] = {key: section[key] for key in section["field_schema"]}
+    temp_path = f"{SOURCE_CONFIG_PATH}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump(values_only, handle, indent=2, sort_keys=True)
+    os.replace(temp_path, SOURCE_CONFIG_PATH)
+
+
+def _credential_state(requirements):
+    if not requirements:
+        return "public"
+    for requirement in requirements:
+        alternatives = requirement.split("|")
+        if not any(os.getenv(name, "") for name in alternatives):
+            return "missing"
+    return "configured"
+
+
+ACTIVE_SOURCES_CONFIG = _load_sources_config()
+SOURCES_CONFIG_UPDATED_AT = utc_now() if "utc_now" in globals() else datetime.now(timezone.utc).isoformat()
+
+
+def get_sources_config():
+    with SOURCE_CONFIG_LOCK:
+        config = copy.deepcopy(ACTIVE_SOURCES_CONFIG)
+    for section in config.values():
+        enabled = set(section.get("enabled_sources", []))
+        for source in section.get("source_inventory", []):
+            source["enabled"] = source["id"] in enabled
+            source["credential_status"] = _credential_state(source.get("credential_env"))
+            endpoint_field = source.get("endpoint_field")
+            if endpoint_field:
+                source["endpoint"] = section.get(endpoint_field)
+        for source in section.get("custom_sources", []):
+            credential_env = source.get("credential_env")
+            section["source_inventory"].append({
+                "id": source["id"],
+                "label": source["label"],
+                "purpose": source.get("purpose"),
+                "endpoint": source.get("endpoint"),
+                "enabled": source.get("enabled", True),
+                "credential_env": [credential_env] if credential_env else [],
+                "credential_status": custom_credential_state([credential_env] if credential_env else []),
+                "custom": True,
+                "adapter": source.get("adapter"),
+                "priority": source.get("priority"),
+            })
+    return config
+
+
+def get_sources_config_meta():
+    return {
+        "updated_at": SOURCES_CONFIG_UPDATED_AT,
+        "persistence": "runtime/sources_config.json",
+        "apply_timing": "next scan or quote-router refresh",
+    }
+
+
+def update_sources_config(new_config):
+    global ACTIVE_SOURCES_CONFIG, SOURCES_CONFIG_UPDATED_AT
+    with SOURCE_CONFIG_LOCK:
+        updated = _merge_sources_config(ACTIVE_SOURCES_CONFIG, new_config)
+        _persist_sources_config(updated)
+        ACTIVE_SOURCES_CONFIG = updated
+        SOURCES_CONFIG_UPDATED_AT = datetime.now(timezone.utc).isoformat()
+    return get_sources_config()
+
+
+def reset_sources_config(section_key=None):
+    global ACTIVE_SOURCES_CONFIG, SOURCES_CONFIG_UPDATED_AT
+    with SOURCE_CONFIG_LOCK:
+        if section_key is None:
+            updated = copy.deepcopy(DEFAULT_SOURCES_CONFIG)
+        elif section_key in DEFAULT_SOURCES_CONFIG:
+            updated = copy.deepcopy(ACTIVE_SOURCES_CONFIG)
+            updated[section_key] = copy.deepcopy(DEFAULT_SOURCES_CONFIG[section_key])
+        else:
+            raise SourcesConfigValidationError(f"Unknown configuration section: {section_key}")
+        _persist_sources_config(updated)
+        ACTIVE_SOURCES_CONFIG = updated
+        SOURCES_CONFIG_UPDATED_AT = datetime.now(timezone.utc).isoformat()
+    return get_sources_config()
+
+
+def get_custom_source_contracts():
+    return contracts_for_ui()
+
+
+def upsert_custom_source(section_key, source_definition):
+    if section_key not in ACTIVE_SOURCES_CONFIG:
+        raise SourcesConfigValidationError(f"Unknown configuration section: {section_key}")
+    existing = copy.deepcopy(ACTIVE_SOURCES_CONFIG[section_key].get("custom_sources", []))
+    source_id = str((source_definition or {}).get("id") or "").strip().lower()
+    replaced = False
+    for index, source in enumerate(existing):
+        if source.get("id") == source_id:
+            existing[index] = source_definition
+            replaced = True
+            break
+    if not replaced:
+        existing.append(source_definition)
+    return update_sources_config({section_key: {"custom_sources": existing}})
+
+
+def remove_custom_source(section_key, source_id):
+    if section_key not in ACTIVE_SOURCES_CONFIG:
+        raise SourcesConfigValidationError(f"Unknown configuration section: {section_key}")
+    existing = copy.deepcopy(ACTIVE_SOURCES_CONFIG[section_key].get("custom_sources", []))
+    filtered = [source for source in existing if source.get("id") != source_id]
+    if len(filtered) == len(existing):
+        raise SourcesConfigValidationError(f"Custom source not found: {source_id}")
+    return update_sources_config({section_key: {"custom_sources": filtered}})
+
+
+def test_custom_source(section_key, source_definition, context=None):
+    if section_key not in ACTIVE_SOURCES_CONFIG:
+        raise SourcesConfigValidationError(f"Unknown configuration section: {section_key}")
+    built_in_ids = [source["id"] for source in DEFAULT_SOURCES_CONFIG[section_key]["source_inventory"]]
+    try:
+        validated = validate_custom_source(section_key, source_definition, built_in_ids)
+        return GenericJsonSource(validated).test(context)
+    except (CustomSourceValidationError, CustomSourceRequestError) as exc:
+        raise SourcesConfigValidationError(str(exc)) from exc
 
 SECTOR_ETFS = [
     {"etf": "XLK", "sector": "Technology"},
@@ -170,14 +703,16 @@ def safe_round(value, digits=2):
         return None
 
 
-def sentiment_score(texts):
+def sentiment_score(texts, positive_words=None, negative_words=None, word_weight=8.0):
     joined = " ".join(t or "" for t in texts).lower()
     tokens = re.findall(r"[a-zA-Z][a-zA-Z\-']+", joined)
     if not tokens:
         return 50
-    positives = sum(1 for token in tokens if token in POSITIVE_WORDS)
-    negatives = sum(1 for token in tokens if token in NEGATIVE_WORDS)
-    return clamp(50 + (positives - negatives) * 8)
+    positive_set = set(positive_words if positive_words is not None else POSITIVE_WORDS)
+    negative_set = set(negative_words if negative_words is not None else NEGATIVE_WORDS)
+    positives = sum(1 for token in tokens if token in positive_set)
+    negatives = sum(1 for token in tokens if token in negative_set)
+    return clamp(50 + (positives - negatives) * float(word_weight))
 
 
 def pct_change(current, previous):
@@ -253,10 +788,22 @@ class OmniRouteClient:
 
 
 class YahooChartProvider:
-    def fetch_bars(self, symbol, range_value="6mo", interval="1d"):
+    def fetch_bars(
+        self,
+        symbol,
+        range_value="6mo",
+        interval="1d",
+        endpoint="https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+        timeout=12,
+    ):
         encoded = urllib.parse.quote(symbol)
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded}?range={range_value}&interval={interval}"
-        response = requests.get(url, headers=HTTP_HEADERS, timeout=12)
+        url = endpoint.replace("{symbol}", encoded)
+        response = requests.get(
+            url,
+            params={"range": range_value, "interval": interval},
+            headers=HTTP_HEADERS,
+            timeout=float(timeout),
+        )
         response.raise_for_status()
         data = response.json()
         result = (data.get("chart", {}).get("result") or [None])[0]
@@ -280,66 +827,238 @@ class YahooChartProvider:
         return bars
 
 
+def fetch_configured_bars(yahoo, symbol, config, range_value, interval):
+    candidates = []
+    if "yahoo_chart" in config.get("enabled_sources", []):
+        candidates.append((100, "yahoo_chart", None))
+    for source in config.get("custom_sources", []):
+        if source.get("enabled") and source.get("adapter") == "bars_json":
+            candidates.append((source.get("priority", 50), source["id"], source))
+    errors = []
+    for _, source_id, source in sorted(candidates, key=lambda item: (item[0], item[1])):
+        try:
+            if source is None:
+                bars = yahoo.fetch_bars(
+                    symbol,
+                    range_value=range_value,
+                    interval=interval,
+                    endpoint=config["yahoo_chart_endpoint"],
+                    timeout=config["request_timeout_seconds"],
+                )
+            else:
+                bars = GenericJsonSource(source).fetch_bars(symbol)
+            return bars, source_id
+        except Exception as exc:
+            errors.append(f"{source_id}: {str(exc)[:160]}")
+    if not candidates:
+        raise RuntimeError("No historical bar source is enabled")
+    raise RuntimeError("; ".join(errors) or "All historical bar sources failed")
+
+
+def _bounded_calibration_value(section_key, field_key, value):
+    meta = DEFAULT_SOURCES_CONFIG[section_key]["field_schema"][field_key]
+    return round(max(meta.get("min", value), min(meta.get("max", value), value)), 6)
+
+
+def calibrate_source_scoring(section_key):
+    if section_key not in ("discovery", "market"):
+        raise SourcesConfigValidationError("Calibration is supported only for discovery and market scoring")
+    config = get_sources_config()[section_key]
+    if section_key == "discovery":
+        symbols = list(dict.fromkeys(
+            entry.partition(":")[0].strip().upper()
+            for entry in config["sector_etfs"]
+            if entry.partition(":")[0].strip()
+        ))
+    else:
+        symbols = list(dict.fromkeys(config["calibration_symbols"]))
+
+    bars_by_symbol = {}
+    sources_by_symbol = {}
+    errors = {}
+    yahoo = YahooChartProvider()
+    max_workers = min(12, max(1, len(symbols)))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                fetch_configured_bars,
+                yahoo,
+                symbol,
+                config,
+                config["calibration_lookback_range"],
+                "1d",
+            ): symbol
+            for symbol in symbols
+        }
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                bars, source_id = future.result()
+                bars_by_symbol[symbol] = bars
+                sources_by_symbol[symbol] = source_id
+            except Exception as exc:
+                errors[symbol] = str(exc)[:200]
+    minimum_symbols = 4
+    if len(bars_by_symbol) < minimum_symbols:
+        raise SourcesConfigValidationError(
+            f"Calibration needs at least {minimum_symbols} symbols with sufficient daily history; "
+            f"received {len(bars_by_symbol)}"
+        )
+    try:
+        result = calibrate_scoring_weights(
+            section_key,
+            bars_by_symbol,
+            config,
+            target_days=config["calibration_target_days"],
+            ridge=config["calibration_ridge_penalty"],
+        )
+    except CalibrationError as exc:
+        raise SourcesConfigValidationError(str(exc)) from exc
+
+    result["requested_symbols"] = symbols
+    result["sources_by_symbol"] = sources_by_symbol
+    result["fetch_errors"] = errors
+    metrics = result["metrics"]
+    passed_holdout = (
+        metrics["validation_correlation"] > 0
+        and metrics["validation_correlation_t_stat"] >= 1.96
+        and metrics["validation_top_quartile_mean_return_pct"]
+        > metrics["validation_all_mean_return_pct"]
+    )
+    if not passed_holdout:
+        result["status"] = "rejected"
+        result["limitations"].insert(
+            0,
+            "Holdout validation did not show statistically credible positive correlation (t ≥ 1.96) plus top-quartile lift, so fitted weights were not applied.",
+        )
+        update_sources_config({section_key: {"scoring_provenance": result}})
+        return {"applied": False, "calibration": result, "config": get_sources_config()}
+
+    fitted = result["weights"]
+    if section_key == "discovery":
+        weight_update = {
+            "weight_5d_return": _bounded_calibration_value(section_key, "weight_5d_return", fitted["return_5d"]),
+            "weight_20d_return": _bounded_calibration_value(section_key, "weight_20d_return", fitted["return_20d"]),
+            "weight_volume_expansion": _bounded_calibration_value(section_key, "weight_volume_expansion", fitted["volume_expansion"]),
+        }
+    else:
+        weight_update = {
+            "weight_5d_return": _bounded_calibration_value(section_key, "weight_5d_return", fitted["return_5d"]),
+            "weight_20d_return": _bounded_calibration_value(section_key, "weight_20d_return", fitted["return_20d"]),
+            "weight_60d_return": _bounded_calibration_value(section_key, "weight_60d_return", fitted["return_60d"]),
+            "sma_short_bonus": _bounded_calibration_value(section_key, "sma_short_bonus", fitted["above_short_sma"]),
+            "sma_long_bonus": _bounded_calibration_value(section_key, "sma_long_bonus", fitted["above_long_sma"]),
+            "weight_volume_expansion": _bounded_calibration_value(section_key, "weight_volume_expansion", fitted["volume_expansion"]),
+            "overbought_penalty": _bounded_calibration_value(section_key, "overbought_penalty", max(0, -fitted["overbought"])),
+        }
+    result["applied_config_weights"] = weight_update
+    updated = update_sources_config({section_key: {**weight_update, "scoring_provenance": result}})
+    return {"applied": True, "calibration": result, "config": updated}
+
+
 class MarketDataAgent:
     def __init__(self):
         self.yahoo = YahooChartProvider()
 
     def run(self, symbols):
+        config = get_sources_config()["market"]
+        custom_bars = [
+            source for source in config.get("custom_sources", [])
+            if source.get("enabled") and source.get("adapter") == "bars_json"
+        ]
+        if "yahoo_chart" not in config["enabled_sources"] and not custom_bars:
+            return {
+                "summary": "Yahoo technical bars disabled in market configuration",
+                "source": "none",
+                "sources_used": [],
+                "metrics": {},
+                "errors": {},
+                "status": "disabled",
+            }
         metrics = {}
         errors = {}
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = {executor.submit(self._symbol_metrics, symbol): symbol for symbol in sorted(set(symbols))}
+        with ThreadPoolExecutor(max_workers=config["max_parallel_requests"]) as executor:
+            futures = {
+                executor.submit(self._symbol_metrics, symbol, config): symbol
+                for symbol in sorted(set(symbols))
+            }
             for future in as_completed(futures):
                 symbol = futures[future]
                 try:
                     metrics[symbol] = future.result()
                 except Exception as exc:
                     errors[symbol] = str(exc)
+        sources_used = sorted({metric.get("source_id") for metric in metrics.values() if metric.get("source_id")})
         return {
-            "summary": f"Yahoo chart metrics for {len(metrics)}/{len(set(symbols))} symbols",
-            "source": "Yahoo Finance chart endpoint",
+            "summary": f"Historical bar metrics for {len(metrics)}/{len(set(symbols))} symbols",
+            "source": " + ".join(sources_used) if sources_used else "none",
+            "sources_used": sources_used,
             "metrics": metrics,
             "errors": errors,
             "status": "degraded" if errors else "ok"
         }
 
-    def _symbol_metrics(self, symbol):
-        bars = self.yahoo.fetch_bars(symbol)
+    def _symbol_metrics(self, symbol, config):
+        bars, source_id = fetch_configured_bars(
+            self.yahoo,
+            symbol,
+            config,
+            config["chart_lookback_range"],
+            config["chart_interval"],
+        )
         closes = [bar["close"] for bar in bars]
         volumes = [bar["volume"] for bar in bars]
         close = closes[-1]
-        sma20 = average(closes[-20:])
-        sma50 = average(closes[-50:]) if len(closes) >= 50 else average(closes)
-        avg_volume20 = average(volumes[-21:-1]) or average(volumes[-20:])
-        volume_ratio = volumes[-1] / avg_volume20 if avg_volume20 else None
+        short_days = config["sma_short_days"]
+        long_days = config["sma_long_days"]
+        sma_short = average(closes[-short_days:])
+        sma_long = average(closes[-long_days:]) if len(closes) >= long_days else average(closes)
+        avg_volume = average(volumes[-short_days - 1:-1]) or average(volumes[-short_days:])
+        volume_ratio = volumes[-1] / avg_volume if avg_volume else None
         ret5 = pct_change(close, closes[-6]) if len(closes) >= 6 else None
         ret20 = pct_change(close, closes[-21]) if len(closes) >= 21 else None
         ret60 = pct_change(close, closes[-61]) if len(closes) >= 61 else None
-        rsi14 = rsi(closes)
+        rsi_value = rsi(closes, config["rsi_days"])
         trend_score = 50
-        for ret, weight in [(ret5, 1.2), (ret20, 1.5), (ret60, 0.8)]:
+        for ret, weight in [
+            (ret5, config["weight_5d_return"]),
+            (ret20, config["weight_20d_return"]),
+            (ret60, config["weight_60d_return"]),
+        ]:
             if ret is not None:
                 trend_score += ret * weight
-        if sma20 and close > sma20:
-            trend_score += 8
-        if sma50 and close > sma50:
-            trend_score += 8
-        if volume_ratio and volume_ratio > 1.2:
-            trend_score += min(8, (volume_ratio - 1.2) * 8)
-        if rsi14 and rsi14 > 75:
-            trend_score -= 8
+        if sma_short and close > sma_short:
+            trend_score += config["sma_short_bonus"]
+        if sma_long and close > sma_long:
+            trend_score += config["sma_long_bonus"]
+        if volume_ratio and volume_ratio > config["minimum_volume_ratio"]:
+            trend_score += min(
+                config["volume_bonus_cap"],
+                (volume_ratio - config["minimum_volume_ratio"]) * config["weight_volume_expansion"],
+            )
+        if rsi_value and rsi_value > config["overbought_rsi"]:
+            trend_score -= config["overbought_penalty"]
         return {
+            "source_id": source_id,
             "price": safe_round(close),
             "last_date": bars[-1]["date"],
             "return_5d": safe_round(ret5),
             "return_20d": safe_round(ret20),
             "return_60d": safe_round(ret60),
-            "sma20": safe_round(sma20),
-            "sma50": safe_round(sma50),
-            "above_sma20": bool(sma20 and close > sma20),
-            "above_sma50": bool(sma50 and close > sma50),
+            "sma20": safe_round(sma_short),
+            "sma50": safe_round(sma_long),
+            "sma_short": safe_round(sma_short),
+            "sma_long": safe_round(sma_long),
+            "sma_short_days": short_days,
+            "sma_long_days": long_days,
+            "above_sma20": bool(sma_short and close > sma_short),
+            "above_sma50": bool(sma_long and close > sma_long),
+            "above_sma_short": bool(sma_short and close > sma_short),
+            "above_sma_long": bool(sma_long and close > sma_long),
             "volume_ratio": safe_round(volume_ratio),
-            "rsi14": safe_round(rsi14),
+            "rsi14": safe_round(rsi_value),
+            "rsi": safe_round(rsi_value),
+            "rsi_days": config["rsi_days"],
             "trend_score": int(clamp(trend_score)),
         }
 
@@ -350,6 +1069,15 @@ class AlpacaDiscoveryAgent:
         self.secret_key = os.getenv("ALPACA_SECRET_KEY", "")
 
     def run(self):
+        config = get_sources_config()["discovery"]
+        if "alpaca_screener" not in config["enabled_sources"]:
+            return {
+                "summary": "Alpaca screeners disabled in discovery configuration",
+                "status": "disabled",
+                "sources_used": [],
+                "movers": [],
+                "actives": [],
+            }
         if not self.api_key or not self.secret_key or ScreenerClient is None:
             return {
                 "summary": "Alpaca credentials or SDK unavailable",
@@ -360,11 +1088,12 @@ class AlpacaDiscoveryAgent:
             }
         try:
             screener = ScreenerClient(self.api_key, self.secret_key)
-            movers = screener.get_market_movers(MarketMoversRequest(top=10, market_type=MarketType.STOCKS))
-            actives = screener.get_most_actives(MostActivesRequest(top=10, by=MostActivesBy.VOLUME))
+            movers = screener.get_market_movers(MarketMoversRequest(top=config["alpaca_movers_count"], market_type=MarketType.STOCKS))
+            actives = screener.get_most_actives(MostActivesRequest(top=config["alpaca_actives_count"], by=MostActivesBy.VOLUME))
             return {
                 "summary": "Alpaca screeners available",
                 "status": "ok",
+                "sources_used": ["alpaca_screener"],
                 "movers": self._model_to_list(movers),
                 "actives": self._model_to_list(actives),
             }
@@ -394,62 +1123,107 @@ class SectorDiscoveryAgent:
         self.yahoo = YahooChartProvider()
 
     def run(self, alpaca_discovery=None):
-        etf_rankings = self._scan_sector_etfs()
-        active_sectors = self._rank_sectors(etf_rankings)
+        config = get_sources_config()["discovery"]
+        configured_etfs = self._configured_etfs(config["sector_etfs"])
+        has_bar_source = "yahoo_chart" in config["enabled_sources"] or any(
+            source.get("enabled") and source.get("adapter") == "bars_json"
+            for source in config.get("custom_sources", [])
+        )
+        etf_rankings = self._scan_sector_etfs(configured_etfs, config) if has_bar_source else []
+        active_sectors = self._rank_sectors(etf_rankings, config)
         active_themes = self._build_active_themes(active_sectors)
-        alpaca_extras = self._alpaca_mover_extras(alpaca_discovery, active_themes)
-        if alpaca_extras:
+        alpaca_extras = self._alpaca_mover_extras(
+            alpaca_discovery,
+            active_themes,
+            config["alpaca_extra_limit"],
+        )
+        custom_extras, custom_screener_sources = self._custom_screener_extras(config)
+        discovery_extras = []
+        for symbol in alpaca_extras + custom_extras:
+            if symbol not in discovery_extras:
+                discovery_extras.append(symbol)
+        discovery_extras = discovery_extras[:config["alpaca_extra_limit"]]
+        if discovery_extras:
             active_themes.append({
-                "name": "Alpaca momentum",
-                "tickers": alpaca_extras,
+                "name": "Dynamic screeners",
+                "tickers": discovery_extras,
                 "etfs": [],
                 "keywords": ["market movers", "high volume", "momentum"],
             })
+        bar_sources = sorted({ranking.get("source_id") for ranking in etf_rankings if ranking.get("source_id")})
+        sources_used = bar_sources + list((alpaca_discovery or {}).get("sources_used", [])) + custom_screener_sources
         return {
             "summary": f"Discovered {len(active_themes)} active themes from {len(active_sectors)} sectors",
-            "status": "ok",
+            "status": "ok" if etf_rankings or discovery_extras else "degraded",
+            "sources_used": list(dict.fromkeys(sources_used)),
             "active_themes": active_themes,
-            "alpaca_extras": alpaca_extras,
+            "alpaca_extras": discovery_extras,
             "discovery_metadata": {
-                "sectors_scanned": len(set(e["etf"] for e in SECTOR_ETFS)),
+                "etfs_configured": len(configured_etfs),
+                "sectors_scanned": len(etf_rankings),
                 "sectors_active": len(active_sectors),
                 "active_sector_names": [s["sector"] for s in active_sectors],
                 "etf_rankings": etf_rankings[:10],
             },
         }
 
-    def _scan_sector_etfs(self):
-        all_etfs = sorted({e["etf"] for e in SECTOR_ETFS})
+    def _configured_etfs(self, entries):
+        configured = []
+        seen = set()
+        static_sectors = {item["etf"]: item["sector"] for item in SECTOR_ETFS}
+        for entry in entries:
+            ticker, separator, sector = entry.partition(":")
+            ticker = ticker.strip().upper()
+            sector = sector.strip() if separator else static_sectors.get(ticker, "Custom")
+            if ticker and ticker not in seen:
+                configured.append({"etf": ticker, "sector": sector or "Custom"})
+                seen.add(ticker)
+        return configured
+
+    def _scan_sector_etfs(self, configured_etfs, config):
         rankings = []
         with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = {executor.submit(self._etf_momentum, etf): etf for etf in all_etfs}
+            futures = {
+                executor.submit(self._etf_momentum, item["etf"], config): item
+                for item in configured_etfs
+            }
             for future in as_completed(futures):
-                etf = futures[future]
+                item = futures[future]
                 try:
                     metrics = future.result()
-                    sector = next((e["sector"] for e in SECTOR_ETFS if e["etf"] == etf), "Unknown")
-                    rankings.append({"etf": etf, "sector": sector, **metrics})
+                    rankings.append({"etf": item["etf"], "sector": item["sector"], **metrics})
                 except Exception:
                     pass
         return sorted(rankings, key=lambda x: x.get("momentum_score", 0), reverse=True)
 
-    def _etf_momentum(self, etf):
-        bars = self.yahoo.fetch_bars(etf, range_value="3mo", interval="1d")
+    def _etf_momentum(self, etf, config):
+        bars, source_id = fetch_configured_bars(
+            self.yahoo,
+            etf,
+            config,
+            config["benchmark_lookback_range"],
+            config["chart_interval"],
+        )
         closes = [b["close"] for b in bars]
         volumes = [b["volume"] for b in bars]
         ret5 = pct_change(closes[-1], closes[-6]) if len(closes) >= 6 else 0
         ret20 = pct_change(closes[-1], closes[-21]) if len(closes) >= 21 else 0
         avg_vol = average(volumes[-21:-1]) or average(volumes)
         vol_ratio = volumes[-1] / avg_vol if avg_vol else 1
-        momentum = (ret5 or 0) * 2.0 + (ret20 or 0) * 1.5 + max(0, (vol_ratio - 1)) * 10
+        momentum = (
+            (ret5 or 0) * config["weight_5d_return"]
+            + (ret20 or 0) * config["weight_20d_return"]
+            + max(0, (vol_ratio - 1)) * config["weight_volume_expansion"]
+        )
         return {
+            "source_id": source_id,
             "return_5d": safe_round(ret5),
             "return_20d": safe_round(ret20),
             "volume_ratio": safe_round(vol_ratio),
             "momentum_score": safe_round(momentum),
         }
 
-    def _rank_sectors(self, etf_rankings):
+    def _rank_sectors(self, etf_rankings, config):
         """Pick sectors where at least one ETF shows meaningful momentum."""
         sector_best = {}
         for r in etf_rankings:
@@ -464,9 +1238,9 @@ class SectorDiscoveryAgent:
         )
         active = []
         for s in ranked:
-            if s["score"] > -5 or len(active) < 3:
+            if s["score"] > config["minimum_momentum_score"] or len(active) < config["minimum_sectors_count"]:
                 active.append(s)
-            if len(active) >= 5:
+            if len(active) >= config["top_sectors_count"]:
                 break
         return active
 
@@ -484,7 +1258,7 @@ class SectorDiscoveryAgent:
                 })
         return themes
 
-    def _alpaca_mover_extras(self, alpaca_discovery, active_themes):
+    def _alpaca_mover_extras(self, alpaca_discovery, active_themes, limit):
         """Return Alpaca movers/actives that are NOT already in any active theme."""
         if not alpaca_discovery:
             return []
@@ -497,40 +1271,100 @@ class SectorDiscoveryAgent:
             sym = (row.get("symbol") or row.get("ticker") or "").upper()
             if sym and sym not in known and sym not in extras:
                 extras.append(sym)
-        return extras[:15]
+        return extras[:limit]
+
+    def _custom_screener_extras(self, config):
+        symbols = []
+        sources_used = []
+        for source in sorted(config.get("custom_sources", []), key=lambda item: item.get("priority", 50)):
+            if not source.get("enabled") or source.get("adapter") != "screener_json":
+                continue
+            try:
+                rows = GenericJsonSource(source).fetch_symbols()
+                sources_used.append(source["id"])
+                for row in rows:
+                    if row["symbol"] not in symbols:
+                        symbols.append(row["symbol"])
+            except Exception:
+                continue
+        return symbols, sources_used
 
 
 class NewsAgent:
     def run(self, themes):
+        config = get_sources_config()["news"]
+        enabled_sources = config["enabled_sources"]
+        custom_sources = [
+            source for source in config.get("custom_sources", [])
+            if source.get("enabled") and source.get("adapter") == "items_json"
+        ]
+        custom_sources.sort(key=lambda item: item.get("priority", 50))
+        sources_used = list(enabled_sources)
         items_by_theme = {}
         all_titles = []
         errors = {}
         for theme in themes:
-            query = f"{theme['name']} stocks " + " ".join(theme["tickers"][:3])
-            try:
-                items = self._yahoo_news(query)
-                items_by_theme[theme["name"]] = items
-                all_titles.extend(item["title"] for item in items)
-            except Exception as exc:
-                errors[theme["name"]] = str(exc)
-                items_by_theme[theme["name"]] = []
+            query = f"{theme['name']} stocks " + " ".join(theme["tickers"][:config["query_ticker_count"]])
+            items = []
+            if "yahoo_search" in enabled_sources:
+                try:
+                    items.extend(self._yahoo_news(query, config))
+                except Exception as exc:
+                    errors[f"{theme['name']}:yahoo_search"] = str(exc)[:220]
+            if "finnhub_company_news" in enabled_sources:
+                try:
+                    items.extend(self._finnhub_news(theme, config))
+                except Exception as exc:
+                    errors[f"{theme['name']}:finnhub_company_news"] = str(exc)[:220]
+            for source in custom_sources:
+                try:
+                    custom_items = GenericJsonSource(source).fetch_items(
+                        query,
+                        theme["name"],
+                        theme["tickers"][0] if theme.get("tickers") else "",
+                    )
+                    items.extend(custom_items)
+                    if source["id"] not in sources_used:
+                        sources_used.append(source["id"])
+                except Exception as exc:
+                    errors[f"{theme['name']}:{source['id']}"] = str(exc)[:220]
+            deduped = []
+            seen = set()
+            for item in items:
+                key = (item.get("title") or "").strip().lower()
+                if key and key not in seen:
+                    seen.add(key)
+                    deduped.append(item)
+            selected = deduped[:config["articles_per_theme"]]
+            items_by_theme[theme["name"]] = selected
+            all_titles.extend(item["title"] for item in selected)
+        status = "disabled" if not enabled_sources and not custom_sources else "degraded" if errors else "ok"
         return {
-            "summary": f"Yahoo news/search returned {sum(len(v) for v in items_by_theme.values())} articles",
-            "source": "Yahoo Finance search news",
+            "summary": f"News sources returned {sum(len(v) for v in items_by_theme.values())} articles",
+            "source": " + ".join(sources_used) if sources_used else "none",
+            "sources_used": sources_used,
             "items_by_theme": items_by_theme,
-            "sentiment": sentiment_score(all_titles),
+            "sentiment": sentiment_score(
+                all_titles,
+                config["positive_keywords"],
+                config["negative_keywords"],
+                config["sentiment_word_weight"],
+            ),
             "errors": errors,
-            "status": "degraded" if errors else "ok"
+            "status": status,
         }
 
-    def _yahoo_news(self, query):
-        encoded = urllib.parse.quote(query)
-        url = f"https://query1.finance.yahoo.com/v1/finance/search?q={encoded}&newsCount=6&quotesCount=0"
-        response = requests.get(url, headers=HTTP_HEADERS, timeout=12)
+    def _yahoo_news(self, query, config):
+        response = requests.get(
+            config["yahoo_search_endpoint"],
+            params={"q": query, "newsCount": config["articles_per_theme"], "quotesCount": 0},
+            headers=HTTP_HEADERS,
+            timeout=config["request_timeout_seconds"],
+        )
         response.raise_for_status()
         raw_items = response.json().get("news") or []
         items = []
-        for item in raw_items[:6]:
+        for item in raw_items[:config["articles_per_theme"]]:
             title = item.get("title") or ""
             if not title:
                 continue
@@ -539,23 +1373,81 @@ class NewsAgent:
                 "publisher": item.get("publisher"),
                 "link": item.get("link"),
                 "published_at": item.get("providerPublishTime"),
+                "source": "Yahoo Finance",
             })
+        return items
+
+    def _finnhub_news(self, theme, config):
+        api_key = os.getenv("FINNHUB_API_KEY", "")
+        if not api_key:
+            raise RuntimeError("FINNHUB_API_KEY is not configured")
+        end_date = date.today()
+        start_date = end_date - timedelta(days=config["finnhub_days_back"])
+        items = []
+        for symbol in theme["tickers"][:config["query_ticker_count"]]:
+            response = requests.get(
+                config["finnhub_company_news_endpoint"],
+                params={
+                    "symbol": symbol,
+                    "from": start_date.isoformat(),
+                    "to": end_date.isoformat(),
+                    "token": api_key,
+                },
+                headers=HTTP_HEADERS,
+                timeout=config["request_timeout_seconds"],
+            )
+            response.raise_for_status()
+            for item in (response.json() or [])[:config["articles_per_theme"]]:
+                title = item.get("headline") or ""
+                if title:
+                    items.append({
+                        "title": title,
+                        "publisher": item.get("source"),
+                        "link": item.get("url"),
+                        "published_at": item.get("datetime"),
+                        "source": "Finnhub",
+                        "symbol": symbol,
+                    })
         return items
 
 
 class SocialSentimentAgent:
     def run(self, themes):
+        config = get_sources_config()["social"]
+        enabled_sources = config["enabled_sources"]
+        custom_sources = [
+            source for source in config.get("custom_sources", [])
+            if source.get("enabled") and source.get("adapter") == "items_json"
+        ]
+        custom_sources.sort(key=lambda item: item.get("priority", 50))
+        sources_used = list(enabled_sources)
         items_by_theme = {}
         all_titles = []
         errors = {}
         for theme in themes:
-            query = f"{theme['name']} " + " ".join(theme["tickers"][:2])
+            query = f"{theme['name']} " + " ".join(theme["tickers"][:config["query_ticker_count"]])
             items = []
-            for fetcher in (self._reddit_rss, self._hacker_news):
+            fetchers = []
+            if "reddit_rss" in enabled_sources:
+                fetchers.append(("reddit_rss", self._reddit_rss))
+            if "hackernews" in enabled_sources:
+                fetchers.append(("hackernews", self._hacker_news))
+            for source_id, fetcher in fetchers:
                 try:
-                    items.extend(fetcher(query))
+                    items.extend(fetcher(query, config))
                 except Exception as exc:
-                    errors[f"{theme['name']}:{fetcher.__name__}"] = str(exc)[:180]
+                    errors[f"{theme['name']}:{source_id}"] = str(exc)[:180]
+            for source in custom_sources:
+                try:
+                    items.extend(GenericJsonSource(source).fetch_items(
+                        query,
+                        theme["name"],
+                        theme["tickers"][0] if theme.get("tickers") else "",
+                    ))
+                    if source["id"] not in sources_used:
+                        sources_used.append(source["id"])
+                except Exception as exc:
+                    errors[f"{theme['name']}:{source['id']}"] = str(exc)[:180]
             deduped = []
             seen = set()
             for item in items:
@@ -563,26 +1455,48 @@ class SocialSentimentAgent:
                 if key not in seen:
                     seen.add(key)
                     deduped.append(item)
-            items_by_theme[theme["name"]] = deduped[:8]
-            all_titles.extend(item["title"] for item in deduped[:8])
+            selected = deduped[:config["items_per_theme"]]
+            items_by_theme[theme["name"]] = selected
+            all_titles.extend(item["title"] for item in selected)
+        status = "disabled" if not enabled_sources and not custom_sources else "degraded" if errors else "ok"
         return {
             "summary": f"Social/news-discussion proxy returned {sum(len(v) for v in items_by_theme.values())} posts",
-            "source": "Reddit RSS + Hacker News Algolia",
+            "source": " + ".join(sources_used) if sources_used else "none",
+            "sources_used": sources_used,
             "items_by_theme": items_by_theme,
-            "sentiment": sentiment_score(all_titles),
+            "sentiment": sentiment_score(
+                all_titles,
+                config["positive_keywords"],
+                config["negative_keywords"],
+                config["sentiment_word_weight"],
+            ),
             "errors": errors,
-            "status": "degraded" if errors else "ok"
+            "status": status,
         }
 
-    def _reddit_rss(self, query):
-        encoded = urllib.parse.quote(query)
-        url = f"https://www.reddit.com/search.rss?q={encoded}&sort=new&t=week"
-        response = requests.get(url, headers=HTTP_HEADERS, timeout=12)
+    def _reddit_rss(self, query, config):
+        subreddit_path = "+".join(
+            urllib.parse.quote(item.strip().replace("r/", ""))
+            for item in config["subreddits"]
+            if item.strip()
+        ) or "all"
+        url = config["reddit_rss_endpoint"].replace("{subreddits}", subreddit_path)
+        response = requests.get(
+            url,
+            params={
+                "q": query,
+                "sort": config["reddit_sort"],
+                "t": config["reddit_time_window"],
+                "restrict_sr": "on" if subreddit_path != "all" else "off",
+            },
+            headers=HTTP_HEADERS,
+            timeout=config["request_timeout_seconds"],
+        )
         response.raise_for_status()
         root = ET.fromstring(response.text)
         namespace = {"atom": "http://www.w3.org/2005/Atom"}
         items = []
-        for entry in root.findall("atom:entry", namespace)[:5]:
+        for entry in root.findall("atom:entry", namespace)[:config["items_per_source"]]:
             title = entry.findtext("atom:title", default="", namespaces=namespace)
             link_el = entry.find("atom:link", namespace)
             link = link_el.attrib.get("href") if link_el is not None else None
@@ -590,13 +1504,18 @@ class SocialSentimentAgent:
                 items.append({"title": title, "source": "Reddit", "link": link})
         return items
 
-    def _hacker_news(self, query):
-        encoded = urllib.parse.quote(query)
-        url = f"https://hn.algolia.com/api/v1/search?query={encoded}&tags=story&hitsPerPage=5"
-        response = requests.get(url, headers=HTTP_HEADERS, timeout=12)
+    def _hacker_news(self, query, config):
+        terms = " ".join(config["hackernews_terms"][:3])
+        full_query = f"{query} {terms}".strip()
+        response = requests.get(
+            config["hackernews_endpoint"],
+            params={"query": full_query, "tags": "story", "hitsPerPage": config["items_per_source"]},
+            headers=HTTP_HEADERS,
+            timeout=config["request_timeout_seconds"],
+        )
         response.raise_for_status()
         items = []
-        for hit in response.json().get("hits", [])[:5]:
+        for hit in response.json().get("hits", [])[:config["items_per_source"]]:
             title = hit.get("title") or hit.get("story_title")
             if title:
                 items.append({"title": title, "source": "Hacker News", "link": hit.get("url")})
@@ -608,26 +1527,65 @@ class FundamentalsAgent:
         self._ticker_map = None
 
     def run(self, symbols):
+        config = get_sources_config()["fundamentals"]
+        custom_sources = [
+            source for source in config.get("custom_sources", [])
+            if source.get("enabled") and source.get("adapter") == "fundamentals_json"
+        ]
+        if "sec_companyfacts" not in config["enabled_sources"] and not custom_sources:
+            return {
+                "summary": "SEC fundamentals disabled in configuration",
+                "source": "none",
+                "sources_used": [],
+                "fundamentals": {},
+                "errors": {},
+                "status": "disabled",
+            }
         fundamentals = {}
         errors = {}
+        sources_used = set()
         for symbol in symbols:
             try:
-                fundamentals[symbol] = self._sec_fundamentals(symbol)
+                fundamentals[symbol] = self._fundamentals_for_symbol(symbol, config)
+                if fundamentals[symbol].get("source_id"):
+                    sources_used.add(fundamentals[symbol]["source_id"])
             except Exception as exc:
                 errors[symbol] = str(exc)[:220]
         return {
-            "summary": f"SEC company facts for {len(fundamentals)}/{len(symbols)} symbols",
-            "source": "SEC companyfacts API",
+            "summary": f"Fundamental snapshots for {len(fundamentals)}/{len(symbols)} symbols",
+            "source": " + ".join(sorted(sources_used)) if sources_used else "none",
+            "sources_used": sorted(sources_used),
             "fundamentals": fundamentals,
             "errors": errors,
             "status": "degraded" if errors else "ok"
         }
 
-    def _load_ticker_map(self):
+    def _fundamentals_for_symbol(self, symbol, config):
+        candidates = []
+        if "sec_companyfacts" in config["enabled_sources"]:
+            candidates.append((100, "sec_companyfacts", None))
+        for source in config.get("custom_sources", []):
+            if source.get("enabled") and source.get("adapter") == "fundamentals_json":
+                candidates.append((source.get("priority", 50), source["id"], source))
+        errors = []
+        for _, source_id, source in sorted(candidates, key=lambda item: (item[0], item[1])):
+            try:
+                if source is None:
+                    return self._sec_fundamentals(symbol, config)
+                result = GenericJsonSource(source).fetch_fundamentals(symbol)
+                return self._score_growth_result(result, config, source_id)
+            except Exception as exc:
+                errors.append(f"{source_id}: {str(exc)[:160]}")
+        raise RuntimeError("; ".join(errors) or "No fundamental source is enabled")
+
+    def _load_ticker_map(self, config):
         if self._ticker_map is not None:
             return self._ticker_map
-        url = "https://www.sec.gov/files/company_tickers.json"
-        response = requests.get(url, headers=HTTP_HEADERS, timeout=12)
+        response = requests.get(
+            config["sec_ticker_map_endpoint"],
+            headers=HTTP_HEADERS,
+            timeout=config["request_timeout_seconds"],
+        )
         response.raise_for_status()
         data = response.json()
         self._ticker_map = {
@@ -639,47 +1597,64 @@ class FundamentalsAgent:
         }
         return self._ticker_map
 
-    def _sec_fundamentals(self, symbol):
-        ticker_map = self._load_ticker_map()
+    def _sec_fundamentals(self, symbol, config):
+        ticker_map = self._load_ticker_map(config)
         if symbol not in ticker_map:
             raise RuntimeError("No SEC CIK mapping")
         company = ticker_map[symbol]
-        url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{company['cik']}.json"
-        response = requests.get(url, headers=HTTP_HEADERS, timeout=12)
+        url = config["sec_companyfacts_endpoint"].replace("{cik}", company["cik"])
+        response = requests.get(
+            url,
+            headers=HTTP_HEADERS,
+            timeout=config["request_timeout_seconds"],
+        )
         response.raise_for_status()
         facts = response.json().get("facts", {}).get("us-gaap", {})
-        revenue_growth = self._yoy_growth(facts, [
-            "Revenues",
-            "RevenueFromContractWithCustomerExcludingAssessedTax",
-            "SalesRevenueNet",
-        ])
-        net_income_growth = self._yoy_growth(facts, ["NetIncomeLoss"])
-        score = 50
-        if revenue_growth is not None:
-            score += clamp(revenue_growth, -25, 25)
-        if net_income_growth is not None:
-            score += clamp(net_income_growth / 2, -20, 20)
-        return {
+        revenue_growth = self._yoy_growth(facts, config["revenue_tags"], config)
+        net_income_growth = self._yoy_growth(facts, config["net_income_tags"], config)
+        return self._score_growth_result({
             "company": company["name"],
             "cik": company["cik"],
+            "revenue_yoy": revenue_growth,
+            "net_income_yoy": net_income_growth,
+        }, config, "sec_companyfacts")
+
+    def _score_growth_result(self, result, config, source_id):
+        revenue_growth = result.get("revenue_yoy")
+        net_income_growth = result.get("net_income_yoy")
+        score = config["base_score"]
+        if revenue_growth is not None:
+            contribution = revenue_growth * config["revenue_growth_weight"]
+            score += clamp(contribution, -config["revenue_contribution_cap"], config["revenue_contribution_cap"])
+        if net_income_growth is not None:
+            contribution = net_income_growth * config["net_income_growth_weight"]
+            score += clamp(contribution, -config["net_income_contribution_cap"], config["net_income_contribution_cap"])
+        return {
+            "company": result.get("company"),
+            "cik": result.get("cik"),
             "revenue_yoy": safe_round(revenue_growth),
             "net_income_yoy": safe_round(net_income_growth),
+            "minimum_revenue_yoy_pct": config["minimum_revenue_yoy_pct"],
+            "meets_revenue_growth_benchmark": bool(
+                revenue_growth is not None and revenue_growth >= config["minimum_revenue_yoy_pct"]
+            ),
             "fundamental_score": int(clamp(score)),
+            "source_id": source_id,
         }
 
-    def _yoy_growth(self, facts, tags):
+    def _yoy_growth(self, facts, tags, config):
         for tag in tags:
             units = facts.get(tag, {}).get("units", {})
-            usd = units.get("USD") or []
+            values = units.get(config["currency_unit"]) or []
             annual = [
-                item for item in usd
-                if item.get("fp") == "FY" and item.get("fy") and item.get("val")
+                item for item in values
+                if item.get("fp") == config["fiscal_period"] and item.get("fy") and item.get("val") is not None
             ]
             annual.sort(key=lambda item: (item.get("fy") or 0, item.get("filed") or ""))
             by_year = {}
             for item in annual:
                 by_year[item["fy"]] = item["val"]
-            if len(by_year) >= 2:
+            if len(by_year) >= config["minimum_history_years"]:
                 years = sorted(by_year)
                 latest = by_year[years[-1]]
                 previous = by_year[years[-2]]
@@ -689,11 +1664,26 @@ class FundamentalsAgent:
 
 class OptionsValidationAgent:
     def run(self, candidates, market_metrics):
+        config = get_sources_config()["market"]
+        if "cboe" not in config["enabled_sources"]:
+            return {
+                "summary": "Cboe option validation disabled in market configuration",
+                "source": "none",
+                "validations": {},
+                "errors": {},
+                "status": "disabled",
+            }
         validations = {}
         errors = {}
         with ThreadPoolExecutor(max_workers=6) as executor:
             futures = {
-                executor.submit(self._validate_symbol, item["ticker"], item["bias"], market_metrics.get(item["ticker"], {})): item
+                executor.submit(
+                    self._validate_symbol,
+                    item["ticker"],
+                    item["bias"],
+                    market_metrics.get(item["ticker"], {}),
+                    config,
+                ): item
                 for item in candidates
             }
             for future in as_completed(futures):
@@ -718,9 +1708,13 @@ class OptionsValidationAgent:
             "status": "degraded" if errors else "ok"
         }
 
-    def _validate_symbol(self, symbol, bias, market_metric):
-        url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{urllib.parse.quote(symbol)}.json"
-        response = requests.get(url, headers=HTTP_HEADERS, timeout=15)
+    def _validate_symbol(self, symbol, bias, market_metric, config):
+        url = config["cboe_endpoint"].replace("{underlying}", urllib.parse.quote(symbol))
+        response = requests.get(
+            url,
+            headers=HTTP_HEADERS,
+            timeout=config["request_timeout_seconds"],
+        )
         response.raise_for_status()
         payload = response.json()
         options = payload.get("data", {}).get("options") or []
@@ -833,6 +1827,7 @@ class ResearcherAgent:
         self.discovery_agent = SectorDiscoveryAgent()
 
     def scan_market(self, market_digest: str = "") -> dict:
+        scan_config = get_sources_config()
         # ── Phase 1: Discovery ─────────────────────────────────
         agent_runs = []
 
@@ -855,7 +1850,7 @@ class ResearcherAgent:
             symbol
             for theme in active_themes
             for symbol in (theme["tickers"] + theme["etfs"])
-        } | set(alpaca_extras) | {"SPY", "QQQ", "IWM", "DIA"})
+        } | set(alpaca_extras) | set(scan_config["market"]["benchmark_symbols"]))
 
         # ── Phase 2: Deep Analysis ─────────────────────────────
         with ThreadPoolExecutor(max_workers=4) as executor:
@@ -875,9 +1870,11 @@ class ResearcherAgent:
         news = results.get("news", {})
         social = results.get("social", {})
 
-        themes = self._rank_themes(market, news, social, active_themes)
-        preliminary = self._rank_preliminary_candidates(themes, market, news, social, alpaca, active_themes)
-        top_for_deep_checks = preliminary[:14]
+        themes = self._rank_themes(market, news, social, active_themes, scan_config)
+        preliminary = self._rank_preliminary_candidates(
+            themes, market, news, social, alpaca, active_themes, scan_config
+        )
+        top_for_deep_checks = preliminary[:scan_config["fundamentals"]["max_symbols"]]
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             futures = {
@@ -919,6 +1916,8 @@ class ResearcherAgent:
             "watchlist": watchlist,
             "debate": debate,
             "discovery": {
+                "sources_used": discovery.get("sources_used", []),
+                "etfs_configured": discovery_meta.get("etfs_configured", 0),
                 "sectors_scanned": discovery_meta.get("sectors_scanned", 0),
                 "sectors_active": discovery_meta.get("sectors_active", 0),
                 "themes_active": len(active_themes),
@@ -928,17 +1927,22 @@ class ResearcherAgent:
             "raw_inputs": {
                 "market": {
                     "source": market.get("source"),
+                    "sources_used": market.get("sources_used", []),
                     "symbols_loaded": len(market.get("metrics", {})),
                     "errors": market.get("errors", {}),
                 },
                 "news": {
                     "source": news.get("source"),
+                    "sources_used": news.get("sources_used", []),
                     "sentiment": news.get("sentiment"),
+                    "items_by_theme": news.get("items_by_theme", {}),
                     "errors": news.get("errors", {}),
                 },
                 "social": {
                     "source": social.get("source"),
+                    "sources_used": social.get("sources_used", []),
                     "sentiment": social.get("sentiment"),
+                    "items_by_theme": social.get("items_by_theme", {}),
                     "errors": social.get("errors", {}),
                 },
                 "alpaca": {
@@ -949,6 +1953,12 @@ class ResearcherAgent:
                     "source": results.get("options", {}).get("source"),
                     "errors": results.get("options", {}).get("errors", {}),
                 },
+                "fundamentals": {
+                    "source": results.get("fundamentals", {}).get("source"),
+                    "sources_used": results.get("fundamentals", {}).get("sources_used", []),
+                    "symbols_loaded": len(results.get("fundamentals", {}).get("fundamentals", {})),
+                    "errors": results.get("fundamentals", {}).get("errors", {}),
+                },
             },
             "token_policy": {
                 "research_model": "none",
@@ -957,7 +1967,7 @@ class ResearcherAgent:
             }
         }
 
-    def _rank_themes(self, market, news, social, active_themes):
+    def _rank_themes(self, market, news, social, active_themes, scan_config):
         metrics = market.get("metrics", {})
         spy_return = (metrics.get("SPY") or {}).get("return_20d") or 0
         ranked = []
@@ -969,8 +1979,8 @@ class ResearcherAgent:
             volume = average([item.get("volume_ratio") for item in ticker_metrics])
             news_items = news.get("items_by_theme", {}).get(theme["name"], [])
             social_items = social.get("items_by_theme", {}).get(theme["name"], [])
-            news_score = sentiment_score([item.get("title") for item in news_items])
-            social_score = sentiment_score([item.get("title") for item in social_items])
+            news_score = self._configured_sentiment(news_items, scan_config["news"])
+            social_score = self._configured_sentiment(social_items, scan_config["social"])
             relative = (ret20 or 0) - spy_return
             strength = clamp(
                 45
@@ -1014,7 +2024,7 @@ class ResearcherAgent:
             })
         return sorted(ranked, key=lambda item: item["strength"], reverse=True)
 
-    def _rank_preliminary_candidates(self, themes, market, news, social, alpaca, active_themes):
+    def _rank_preliminary_candidates(self, themes, market, news, social, alpaca, active_themes, scan_config):
         metrics = market.get("metrics", {})
         theme_by_name = {theme["name"]: theme for theme in themes}
         theme_config_by_name = {theme["name"]: theme for theme in active_themes}
@@ -1028,8 +2038,8 @@ class ResearcherAgent:
                     continue
                 news_items = news.get("items_by_theme", {}).get(theme["name"], [])
                 social_items = social.get("items_by_theme", {}).get(theme["name"], [])
-                news_score = sentiment_score([item.get("title") for item in news_items])
-                social_score = sentiment_score([item.get("title") for item in social_items])
+                news_score = self._configured_sentiment(news_items, scan_config["news"])
+                social_score = self._configured_sentiment(social_items, scan_config["social"])
                 active_bonus = 5 if symbol in active_symbols else 0
                 score = clamp(
                     theme["strength"] * 0.30
@@ -1060,26 +2070,76 @@ class ResearcherAgent:
                 })
         return sorted(candidates, key=lambda item: item["pre_options_score"], reverse=True)
 
+    def _configured_sentiment(self, items, config):
+        return sentiment_score(
+            [item.get("title") for item in items],
+            config["positive_keywords"],
+            config["negative_keywords"],
+            config["sentiment_word_weight"],
+        )
+
     def _build_watchlist(self, preliminary, fundamentals, options):
+        fundamentals_config = get_sources_config()["fundamentals"]
         fundamental_by_symbol = fundamentals.get("fundamentals", {})
         option_by_symbol = options.get("validations", {})
+
+        shortlisted = [
+            item for item in preliminary
+            if option_by_symbol.get(item["ticker"], {}).get("status") in {"validated", "weak"}
+        ]
+
+        # Fetch deep US intelligence (Form 4 Insider, Congress STOCK Act, 8-K, Seasonality, 13F) in parallel
+        intel_by_symbol = {}
+        if shortlisted:
+            with ThreadPoolExecutor(max_workers=min(8, max(1, len(shortlisted)))) as pool:
+                future_to_sym = {pool.submit(compute_intelligence_scoring, item["ticker"]): item["ticker"] for item in shortlisted}
+                for future in as_completed(future_to_sym):
+                    sym = future_to_sym[future]
+                    try:
+                        intel_by_symbol[sym] = future.result()
+                    except Exception:
+                        intel_by_symbol[sym] = {
+                            "symbol": sym,
+                            "intelligence_score": 50,
+                            "composite_signal": "neutral",
+                            "bull_catalysts": [],
+                            "bear_catalysts": [],
+                        }
+
         watchlist = []
-        for item in preliminary:
+        for item in shortlisted:
             option_validation = option_by_symbol.get(item["ticker"], {
                 "status": "not_checked",
                 "score": 0,
                 "reason": "Candidate was below deep-check cutoff.",
                 "selected_contract": None,
             })
-            if option_validation["status"] not in {"validated", "weak"}:
-                continue
             fundamental = fundamental_by_symbol.get(item["ticker"], {})
             fundamental_score = fundamental.get("fundamental_score", 50)
+
+            intel = intel_by_symbol.get(item["ticker"], {
+                "symbol": item["ticker"],
+                "intelligence_score": 50,
+                "composite_signal": "neutral",
+                "bull_catalysts": [],
+                "bear_catalysts": [],
+            })
+            intel_score = intel.get("intelligence_score", 50)
+            intel_sig = intel.get("composite_signal", "neutral")
+
+            # Balanced weights: preliminary (50%), options liquidity (20%), SEC fundamentals (15%), US intelligence (15%)
+            preliminary_weight = 0.50
+            options_weight = 0.20
+            fundamentals_weight = 0.15
+            intel_weight = 0.15
+
             score = clamp(
-                item["pre_options_score"] * 0.62
-                + option_validation.get("score", 0) * 0.25
-                + fundamental_score * 0.13
+                item["pre_options_score"] * preliminary_weight
+                + option_validation.get("score", 0) * options_weight
+                + fundamental_score * fundamentals_weight
+                + intel_score * intel_weight
             )
+
             risk_notes = []
             selected_contract = option_validation.get("selected_contract")
             if selected_contract:
@@ -1089,13 +2149,38 @@ class ResearcherAgent:
                     risk_notes.append("Premium near max risk cap")
             if score < 65:
                 risk_notes.append("Score is watch-only until stronger confirmation")
+
+            for bear_note in intel.get("bear_catalysts", []):
+                risk_notes.append(bear_note)
+
+            tech_sc = item.get("technical_score", 50)
+            news_sc = item.get("news_score", 50)
+            opt_sc = option_validation.get("score", 0)
+            fund_sc = fundamental_score
+            rev_yoy = fundamental.get("revenue_yoy")
+            rev_str = f"+{rev_yoy:.1f}% YoY Rev" if rev_yoy is not None else "SEC baseline"
+
+            selection_reason = (
+                f"Selected via active theme '{item.get('theme')}' with {tech_sc}/100 price momentum, "
+                f"{news_sc}/100 news sentiment, {rev_str} & {intel_score}/100 intelligence ({intel_sig})."
+            )
+            score_breakdown = (
+                f"Score {int(score)}/100 = preliminary multi-source {item['pre_options_score']} (50%) + "
+                f"option liquidity {opt_sc} (20%) + SEC fundamentals {fund_sc} (15%) + "
+                f"US intelligence {intel_score} (15%)."
+            )
+
             enriched = dict(item)
             enriched.update({
                 "score": int(score),
                 "fundamental_score": int(fundamental_score),
+                "intelligence_score": int(intel_score),
                 "fundamentals": fundamental,
+                "intelligence": intel,
                 "options": option_validation,
                 "risk_notes": risk_notes,
+                "selection_reason": selection_reason,
+                "score_breakdown": score_breakdown,
             })
             watchlist.append(enriched)
         return sorted(watchlist, key=lambda item: item["score"], reverse=True)[:8]
@@ -1108,14 +2193,18 @@ class ResearcherAgent:
         bear_points = []
         if top_theme:
             bull_points.append(f"Top theme is {top_theme['name']} with strength {top_theme['strength']}/100.")
-        for item in watchlist[:3]:
+        for item in watchlist[:4]:
             contract = item.get("options", {}).get("selected_contract")
             if contract:
                 bull_points.append(
                     f"{item['ticker']} has validated {contract['dte']} DTE {contract['type']} liquidity with {contract['open_interest']} OI."
                 )
+            for bull_c in item.get("intelligence", {}).get("bull_catalysts", []):
+                bull_points.append(bull_c)
             if item.get("risk_notes"):
-                bear_points.extend(f"{item['ticker']}: {note}" for note in item["risk_notes"])
+                bear_points.extend(f"{item['ticker']}: {note}" for note in item["risk_notes"] if not note.startswith(item['ticker']))
+                bear_points.extend(note for note in item["risk_notes"] if note.startswith(item['ticker']))
+
         if spy.get("above_sma50") is False:
             bear_points.append("SPY is below its 50D average, so long premium needs tighter confirmation.")
         if qqq.get("rsi14") and qqq["rsi14"] > 75:
@@ -1125,9 +2214,12 @@ class ResearcherAgent:
         manager = "Watchlist ready; wait for verified TradingView alert before any order."
         if not watchlist:
             manager = "No option-validated watchlist from current data."
+        # Remove duplicate points while preserving order
+        bull_points = list(dict.fromkeys(bull_points))
+        bear_points = list(dict.fromkeys(bear_points))
         return {
-            "bull": bull_points[:5],
-            "bear": bear_points[:5],
+            "bull": bull_points[:6],
+            "bear": bear_points[:6],
             "risk": {
                 "market_regime": "risk_on" if spy.get("above_sma50") else "caution",
                 "spy_trend_score": spy.get("trend_score"),

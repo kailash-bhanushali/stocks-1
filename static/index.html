@@ -18,6 +18,7 @@
         </div>
         <div class="controls">
             <span class="updated" id="last-updated">--</span>
+            <button class="btn-secondary" id="btn-config" title="Configure Real-time Data Sources">⚙️ Config Sources</button>
             <button class="btn-primary" id="btn-scan">▶ Run Scan</button>
         </div>
     </header>
@@ -29,45 +30,93 @@
         <section class="phase" id="ph-sources">
             <div class="phase-label">Data Sources</div>
             <div class="source-lanes">
-                <div class="lane" id="lane-discovery">
-                    <span class="lane-icon">🔍</span>
-                    <div class="lane-info">
-                        <strong>Discovery</strong>
-                        <small>Sector ETF momentum</small>
+                <div class="lane-wrap">
+                    <div class="lane" id="lane-discovery">
+                        <span class="lane-icon">🔍</span>
+                        <div class="lane-info">
+                            <strong>Discovery</strong>
+                            <small>Sector ETF momentum</small>
+                        </div>
+                        <span class="lane-badge" id="disc-badge">--</span>
+                        <button class="drawer-toggle" id="toggle-disc" title="Expand scanned location & items">▼</button>
                     </div>
-                    <span class="lane-badge" id="disc-badge">--</span>
+                    <div class="lane-drawer" id="drawer-disc" style="display:none;"></div>
                 </div>
-                <div class="lane" id="lane-market">
-                    <span class="lane-icon">📊</span>
-                    <div class="lane-info">
-                        <strong>Market</strong>
-                        <small>Yahoo Finance · price & volume</small>
+
+                <div class="lane-wrap">
+                    <div class="lane" id="lane-market">
+                        <span class="lane-icon">📊</span>
+                        <div class="lane-info">
+                            <strong>Market</strong>
+                            <small>Yahoo Finance · price & volume</small>
+                        </div>
+                        <span class="lane-badge" id="mkt-badge">--</span>
+                        <button class="drawer-toggle" id="toggle-mkt" title="Expand scanned location & items">▼</button>
                     </div>
-                    <span class="lane-badge" id="mkt-badge">--</span>
+                    <div class="lane-drawer" id="drawer-mkt" style="display:none;"></div>
                 </div>
-                <div class="lane" id="lane-news">
-                    <span class="lane-icon">📰</span>
-                    <div class="lane-info">
-                        <strong>News</strong>
-                        <small>Yahoo News headlines</small>
+
+                <div class="lane-wrap">
+                    <div class="lane" id="lane-news">
+                        <span class="lane-icon">📰</span>
+                        <div class="lane-info">
+                            <strong>News</strong>
+                            <small>Yahoo News headlines</small>
+                        </div>
+                        <span class="lane-badge" id="news-badge">--</span>
+                        <button class="drawer-toggle" id="toggle-news" title="Expand scanned location & items">▼</button>
                     </div>
-                    <span class="lane-badge" id="news-badge">--</span>
+                    <div class="lane-drawer" id="drawer-news" style="display:none;"></div>
                 </div>
-                <div class="lane" id="lane-social">
-                    <span class="lane-icon">💬</span>
-                    <div class="lane-info">
-                        <strong>Social</strong>
-                        <small>Reddit RSS · HackerNews</small>
+
+                <div class="lane-wrap">
+                    <div class="lane" id="lane-social">
+                        <span class="lane-icon">💬</span>
+                        <div class="lane-info">
+                            <strong>Social</strong>
+                            <small>Reddit RSS · HackerNews</small>
+                        </div>
+                        <span class="lane-badge" id="social-badge">--</span>
+                        <button class="drawer-toggle" id="toggle-social" title="Expand scanned location & items">▼</button>
                     </div>
-                    <span class="lane-badge" id="social-badge">--</span>
+                    <div class="lane-drawer" id="drawer-social" style="display:none;"></div>
                 </div>
-                <div class="lane" id="lane-sec">
-                    <span class="lane-icon">📁</span>
-                    <div class="lane-info">
-                        <strong>Fundamentals</strong>
-                        <small>SEC XBRL company facts</small>
+
+                <div class="lane-wrap">
+                    <div class="lane" id="lane-sec">
+                        <span class="lane-icon">📁</span>
+                        <div class="lane-info">
+                            <strong>Fundamentals</strong>
+                            <small>SEC XBRL company facts</small>
+                        </div>
+                        <span class="lane-badge" id="sec-badge">--</span>
+                        <button class="drawer-toggle" id="toggle-sec" title="Expand scanned location & items">▼</button>
                     </div>
-                    <span class="lane-badge" id="sec-badge">--</span>
+                    <div class="lane-drawer" id="drawer-sec" style="display:none;"></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Arrow -->
+        <div class="arrow-connector">
+            <svg width="48" height="24" viewBox="0 0 48 24" fill="none">
+                <path d="M0 12H40M32 4L40 12L32 20" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+        </div>
+
+        <!-- ── Data Sources Final Selection Summary Card ── -->
+        <section class="phase selection-phase" id="ph-selection">
+            <div class="phase-label">
+                <span>Selected Universe</span>
+                <span class="pill-sm" id="universe-count">0 Selected</span>
+            </div>
+            <div class="selection-body">
+                <div class="selection-head">
+                    <span class="selection-icon">🎯</span>
+                    <small>Final candidate tickers passed to Research Team</small>
+                </div>
+                <div class="universe-grid" id="universe-grid">
+                    <span class="empty-hint">Run scan to populate dynamic universe</span>
                 </div>
             </div>
         </section>
@@ -141,6 +190,14 @@
                         <span>--</span>
                     </div>
                 </div>
+                <!-- Live Option Stream -->
+                <div class="option-stream-section">
+                    <div class="stream-header">
+                        <strong>📡 Live Option Stream</strong>
+                        <span class="stream-status" id="stream-status">disconnected</span>
+                    </div>
+                    <div class="stream-rows" id="option-stream"></div>
+                </div>
             </div>
         </section>
 
@@ -179,10 +236,130 @@
     </main>
 
     <!-- Event Log Strip -->
-    <footer class="event-strip">
-        <span class="event-title">Events</span>
-        <div class="event-scroll" id="events"></div>
-    </footer>
+    <!-- Data Sources Real-time Configuration Modal -->
+    <div class="modal-overlay" id="config-modal" style="display:none;">
+        <div class="modal-card">
+            <div class="modal-head">
+                <div>
+                    <h2>⚙️ Data Sources Real-Time Configuration</h2>
+                    <small>Inspect active APIs, endpoints, and parameters. Modify configuration in real-time.</small>
+                </div>
+                <button class="modal-close" id="modal-close" aria-label="Close source configuration">✕</button>
+            </div>
+
+            <!-- Tab Navigation for 5 Data Sources -->
+            <div class="modal-tabs" role="tablist" aria-label="Data source sections">
+                <button class="tab-btn is-active" role="tab" aria-selected="true" data-tab="tab-discovery">🔍 1. Discovery</button>
+                <button class="tab-btn" role="tab" aria-selected="false" data-tab="tab-market">📊 2. Market</button>
+                <button class="tab-btn" role="tab" aria-selected="false" data-tab="tab-news">📰 3. News</button>
+                <button class="tab-btn" role="tab" aria-selected="false" data-tab="tab-social">💬 4. Social</button>
+                <button class="tab-btn" role="tab" aria-selected="false" data-tab="tab-fundamentals">📁 5. Fundamentals</button>
+            </div>
+
+            <div class="modal-body" id="modal-form-container">
+                <!-- Forms populated dynamically via app.js -->
+            </div>
+
+            <div class="modal-foot">
+                <span class="save-status" id="cfg-save-status"></span>
+                <div class="foot-btns">
+                    <button class="btn-secondary" id="btn-reset-cfg">Reset Current Tab</button>
+                    <button class="btn-primary" id="btn-save-cfg">💾 Save & Apply Config</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+
+    <!-- ── Intelligence Drawer (opens on watchlist ticker click) ── -->
+    <div class="intel-overlay" id="intel-overlay" style="display:none;"></div>
+    <aside class="intel-drawer" id="intel-drawer" role="dialog" aria-modal="true" aria-label="Stock Intelligence Panel" style="display:none;">
+        <div class="intel-head">
+            <div class="intel-title">
+                <span class="intel-icon">🧠</span>
+                <div>
+                    <h2 id="intel-symbol">--</h2>
+                    <small>US Market Intelligence · SEC EDGAR + Yahoo Finance</small>
+                </div>
+                <span class="intel-signal-badge" id="intel-signal">neutral</span>
+            </div>
+            <button class="intel-close" id="intel-close" aria-label="Close intelligence panel">✕</button>
+        </div>
+
+        <!-- Tab Navigation -->
+        <div class="intel-tabs" role="tablist">
+            <button class="intel-tab is-active" data-itab="insider"  role="tab">📋 Insider</button>
+            <button class="intel-tab" data-itab="congress" role="tab">🏛️ Congress</button>
+            <button class="intel-tab" data-itab="actions"  role="tab">📅 Actions</button>
+            <button class="intel-tab" data-itab="ownership" role="tab">🏦 Ownership</button>
+            <button class="intel-tab" data-itab="seasonal" role="tab">📈 Seasonal</button>
+        </div>
+
+        <!-- Tab bodies -->
+        <div class="intel-body">
+            <!-- Insider Trades -->
+            <div class="intel-panel is-active" id="itab-insider">
+                <div class="intel-source-bar" id="insider-source"></div>
+                <div class="intel-summary" id="insider-summary"></div>
+                <div class="intel-table-wrap">
+                    <table class="intel-table" id="insider-table">
+                        <thead><tr><th>Person</th><th>Type</th><th>Shares</th><th>Price</th><th>Value</th><th>Date</th></tr></thead>
+                        <tbody id="insider-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Congress Trades -->
+            <div class="intel-panel" id="itab-congress">
+                <div class="intel-source-bar" id="congress-source"></div>
+                <div class="intel-note" id="congress-note"></div>
+                <div class="intel-summary" id="congress-summary"></div>
+                <div class="intel-table-wrap">
+                    <table class="intel-table" id="congress-table">
+                        <thead><tr><th>Member</th><th>Party</th><th>Type</th><th>Amount Range</th><th>Traded</th><th>Disclosed</th></tr></thead>
+                        <tbody id="congress-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Corporate Actions -->
+            <div class="intel-panel" id="itab-actions">
+                <div class="intel-source-bar" id="actions-source"></div>
+                <div class="intel-summary" id="actions-summary"></div>
+                <div class="intel-timeline" id="actions-timeline"></div>
+            </div>
+
+            <!-- Ownership -->
+            <div class="intel-panel" id="itab-ownership">
+                <div class="intel-source-bar" id="ownership-source"></div>
+                <div class="intel-summary" id="ownership-summary"></div>
+                <div class="intel-table-wrap">
+                    <table class="intel-table" id="ownership-table">
+                        <thead><tr><th>Institution</th><th>% Held</th><th>Shares</th><th>QoQ Change</th></tr></thead>
+                        <tbody id="ownership-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Seasonality -->
+            <div class="intel-panel" id="itab-seasonal">
+                <div class="intel-source-bar" id="seasonal-source"></div>
+                <div class="intel-summary" id="seasonal-summary"></div>
+                <div class="intel-season-wrap">
+                    <div class="season-bars" id="season-bars"></div>
+                    <div class="season-legend">
+                        <span class="leg-pos">▲ Positive</span>
+                        <span class="leg-neg">▼ Negative</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="intel-foot">
+            <span id="intel-fetch-status" class="intel-fetch-status"></span>
+            <a id="intel-sec-link" href="#" target="_blank" rel="noopener" class="intel-ext-link">🔗 View on SEC EDGAR</a>
+        </div>
+    </aside>
 
     <script src="/static/app.js"></script>
 </body>

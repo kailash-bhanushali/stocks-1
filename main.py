@@ -18,6 +18,7 @@ import uvicorn
 from alpaca_service import alpaca_account_summary
 from agents import OmniRouteClient, ResearcherAgent, TechnicalConfirmationAgent, TraderAgent
 from data_feed_router import DataFeedRouter
+from intelligence_agent import fetch_all_intelligence, fetch_insider_trades, fetch_congress_trades, fetch_corporate_actions, fetch_ownership, fetch_seasonality
 from lean_adapter import build_lean_universe, write_lean_universe
 from option_streamer import alpaca_option_stream
 
@@ -304,7 +305,8 @@ def refresh_data_feed_status(force: bool = False) -> Dict[str, Any]:
         pipeline_state["data_feeds"] = payload
         return payload
     try:
-        snapshot = data_feeds.snapshot(watchlist)
+        from agents import get_sources_config
+        snapshot = data_feeds.snapshot(watchlist, get_sources_config()["market"])
         provider_counts = {
             "ok": sum(1 for item in snapshot["providers"] if item.get("status") == "ok"),
             "not_configured": sum(1 for item in snapshot["providers"] if item.get("status") == "not_configured"),
@@ -354,10 +356,8 @@ def sync_option_stream_subscriptions(research: Dict[str, Any], data_feed_status:
     contracts = watchlist_option_contracts(research)
     if data_feed_status:
         seed_option_stream_quotes(data_feed_status)
-    if contracts:
-        status = alpaca_option_stream.set_symbols(contracts)
-    else:
-        status = alpaca_option_stream.snapshot()
+    # An empty latest watchlist must also clear old subscriptions and quotes.
+    status = alpaca_option_stream.set_symbols(contracts)
     pipeline_state["option_stream"] = status
     return status
 
@@ -791,6 +791,95 @@ def option_stream_status():
     return {"status": "ok", "option_stream": pipeline_state["option_stream"]}
 
 
+@app.get("/api/sources/config")
+def get_sources_config_route():
+    from agents import get_custom_source_contracts, get_sources_config, get_sources_config_meta
+    return {
+        "status": "ok",
+        "config": get_sources_config(),
+        "meta": get_sources_config_meta(),
+        "source_contracts": get_custom_source_contracts(),
+    }
+
+
+@app.post("/api/sources/config")
+async def update_sources_config_route(request: Request):
+    from agents import SourcesConfigValidationError, get_sources_config_meta, update_sources_config
+    try:
+        body = await request.json()
+        updated = update_sources_config(body)
+    except (json.JSONDecodeError, SourcesConfigValidationError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    pipeline_state["data_feeds"]["checked_at"] = None
+    event("Data sources configuration updated in real-time.", "info")
+    return {"status": "ok", "config": updated, "meta": get_sources_config_meta()}
+
+
+@app.post("/api/sources/config/reset")
+async def reset_sources_config_route(request: Request):
+    from agents import SourcesConfigValidationError, get_sources_config_meta, reset_sources_config
+    try:
+        body = await request.json()
+        section = body.get("section") if isinstance(body, dict) else None
+        updated = reset_sources_config(section)
+    except (json.JSONDecodeError, SourcesConfigValidationError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    pipeline_state["data_feeds"]["checked_at"] = None
+    event(f"Data source configuration reset to defaults{f' for {section}' if section else ''}.", "info")
+    return {"status": "ok", "config": updated, "meta": get_sources_config_meta()}
+
+
+@app.put("/api/sources/config/source")
+async def upsert_custom_source_route(request: Request):
+    from agents import SourcesConfigValidationError, get_sources_config_meta, upsert_custom_source
+    try:
+        body = await request.json()
+        section = body.get("section")
+        source = body.get("source")
+        updated = upsert_custom_source(section, source)
+    except (json.JSONDecodeError, SourcesConfigValidationError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    pipeline_state["data_feeds"]["checked_at"] = None
+    event(f"Custom {section} source '{source.get('id')}' saved.", "info")
+    return {"status": "ok", "config": updated, "meta": get_sources_config_meta()}
+
+
+@app.post("/api/sources/config/source/test")
+async def test_custom_source_route(request: Request):
+    from agents import SourcesConfigValidationError, test_custom_source
+    try:
+        body = await request.json()
+        result = test_custom_source(body.get("section"), body.get("source"), body.get("context"))
+    except (json.JSONDecodeError, SourcesConfigValidationError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return result
+
+
+@app.delete("/api/sources/config/source/{section}/{source_id}")
+def remove_custom_source_route(section: str, source_id: str):
+    from agents import SourcesConfigValidationError, get_sources_config_meta, remove_custom_source
+    try:
+        updated = remove_custom_source(section, source_id)
+    except (SourcesConfigValidationError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    pipeline_state["data_feeds"]["checked_at"] = None
+    event(f"Custom {section} source '{source_id}' removed.", "info")
+    return {"status": "ok", "config": updated, "meta": get_sources_config_meta()}
+
+
+@app.post("/api/sources/config/calibrate/{section}")
+def calibrate_sources_scoring_route(section: str):
+    from agents import SourcesConfigValidationError, calibrate_source_scoring, get_sources_config_meta
+    try:
+        result = calibrate_source_scoring(section)
+    except (SourcesConfigValidationError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    pipeline_state["data_feeds"]["checked_at"] = None
+    outcome = "applied" if result["applied"] else "rejected by holdout validation"
+    event(f"{section.title()} score calibration {outcome}.", "info")
+    return {"status": "ok", **result, "meta": get_sources_config_meta()}
+
+
 @app.websocket("/ws/options")
 async def option_stream_websocket(websocket: WebSocket):
     await websocket.accept()
@@ -860,6 +949,63 @@ async def receive_tradingview_webhook(webhook: Request):
     except Exception as exc:
         print(f"Error processing webhook: {exc}")
         raise HTTPException(status_code=400, detail=f"Invalid TradingView webhook payload: {exc}")
+
+
+# ── Intelligence endpoints (US market intelligence via SEC EDGAR + Yahoo) ──
+
+@app.get("/api/intelligence/{symbol}")
+async def intelligence_all(symbol: str):
+    """All 5 intelligence modules for a ticker in one call."""
+    sym = symbol.upper().strip()
+    try:
+        return fetch_all_intelligence(sym)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/intelligence/{symbol}/insider")
+async def intelligence_insider(symbol: str):
+    """SEC EDGAR Form 4 insider trades for a ticker."""
+    try:
+        return fetch_insider_trades(symbol.upper())
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/intelligence/{symbol}/congress")
+async def intelligence_congress(symbol: str):
+    """STOCK Act congressional trades for a ticker."""
+    try:
+        return fetch_congress_trades(symbol.upper())
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/intelligence/{symbol}/actions")
+async def intelligence_actions(symbol: str):
+    """SEC EDGAR 8-K corporate actions + Yahoo dividends/splits."""
+    try:
+        return fetch_corporate_actions(symbol.upper())
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/intelligence/{symbol}/ownership")
+async def intelligence_ownership(symbol: str):
+    """SEC EDGAR 13F institutional ownership for a ticker."""
+    try:
+        return fetch_ownership(symbol.upper())
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/intelligence/{symbol}/seasonality")
+async def intelligence_seasonality(symbol: str):
+    """5-year monthly return seasonality from Yahoo Finance."""
+    try:
+        return fetch_seasonality(symbol.upper())
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/health")

@@ -8,6 +8,8 @@ import urllib.parse
 import requests
 from dotenv import load_dotenv
 
+from source_adapters import GenericJsonSource
+
 try:
     from alpaca.data.enums import DataFeed, OptionsFeed
     from alpaca.data.historical import OptionHistoricalDataClient, StockHistoricalDataClient
@@ -95,36 +97,54 @@ class DataFeedRouter:
         self.stock_feed = os.getenv("ALPACA_STOCK_FEED", "iex").lower()
         self.option_feed = os.getenv("ALPACA_OPTION_FEED", "indicative").lower()
 
-    def snapshot(self, watchlist):
+    def snapshot(self, watchlist, config=None):
         self._load_config()
-        symbols = [item["ticker"] for item in watchlist if item.get("ticker")][:8]
+        config = config or {}
+        enabled_sources = set(config.get("enabled_sources", ["alpaca", "cboe", "finnhub", "alpha_vantage", "massive"]))
+        symbols = [
+            item["ticker"] for item in watchlist if item.get("ticker")
+        ][:int(config.get("max_quote_symbols", 8))]
         contracts = [
             (item.get("options") or {}).get("selected_contract", {}).get("symbol")
             for item in watchlist
         ]
-        contracts = [contract for contract in contracts if contract][:8]
+        contracts = [contract for contract in contracts if contract][:int(config.get("max_quote_contracts", 8))]
 
         providers = []
+        provider_jobs = {
+            "alpaca": ("Alpaca market data", lambda: self._alpaca_snapshots(symbols, contracts)),
+            "cboe": ("Cboe delayed options", lambda: self._cboe_option_quotes(contracts, config)),
+            "finnhub": ("Finnhub stock quotes", lambda: self._finnhub_quotes(symbols[:4], config)),
+            "alpha_vantage": ("Alpha Vantage quote", lambda: self._alpha_vantage_quote(symbols[:1], config)),
+            "massive": ("Massive stock snapshots", lambda: self._massive_snapshots(symbols[:4], config)),
+        }
+        for source in config.get("custom_sources", []):
+            if source.get("enabled") and source.get("adapter") == "quote_json":
+                provider_jobs[source["id"]] = (
+                    source["label"],
+                    lambda source=source: self._custom_quotes(symbols, source),
+                )
         with ThreadPoolExecutor(max_workers=6) as executor:
             futures = [
-                executor.submit(timed_provider, "alpaca", "Alpaca market data", lambda: self._alpaca_snapshots(symbols, contracts)),
-                executor.submit(timed_provider, "cboe", "Cboe delayed options", lambda: self._cboe_option_quotes(contracts)),
-                executor.submit(timed_provider, "finnhub", "Finnhub stock quotes", lambda: self._finnhub_quotes(symbols[:4])),
-                executor.submit(timed_provider, "alpha_vantage", "Alpha Vantage quote", lambda: self._alpha_vantage_quote(symbols[:1])),
-                executor.submit(timed_provider, "massive", "Massive stock snapshots", lambda: self._massive_snapshots(symbols[:4])),
+                executor.submit(timed_provider, provider_id, provider_jobs[provider_id][0], provider_jobs[provider_id][1])
+                for provider_id in provider_jobs
+                if provider_id in enabled_sources or provider_id in {
+                    source.get("id") for source in config.get("custom_sources", []) if source.get("enabled")
+                }
             ]
             for future in as_completed(futures):
                 providers.append(future.result())
 
-        underlyings = self._merge_underlyings(symbols, providers)
+        underlyings = self._merge_underlyings(symbols, providers, config)
         options = self._merge_options(contracts, providers)
         return {
             "generated_at": utc_now(),
             "mode": "read_only_router",
             "symbols": symbols,
             "contracts": contracts,
+            "enabled_sources": sorted(enabled_sources),
             "primary": {
-                "underlying": self._first_ok_provider(providers, "underlyings"),
+                "underlying": self._first_ok_provider(providers, "underlyings", config),
                 "options": self._first_ok_provider(providers, "options"),
             },
             "providers": sorted(providers, key=lambda item: item["provider"]),
@@ -211,7 +231,7 @@ class DataFeedRouter:
             "errors": errors,
         }
 
-    def _finnhub_quotes(self, symbols):
+    def _finnhub_quotes(self, symbols, config):
         if not self.finnhub_key:
             return {"status": "not_configured", "detail": "FINNHUB_API_KEY missing", "underlyings": {}}
         quotes = {}
@@ -219,9 +239,9 @@ class DataFeedRouter:
         for symbol in symbols:
             try:
                 response = requests.get(
-                    "https://finnhub.io/api/v1/quote",
+                    config.get("finnhub_quote_endpoint", "https://finnhub.io/api/v1/quote"),
                     params={"symbol": symbol, "token": self.finnhub_key},
-                    timeout=8,
+                    timeout=float(config.get("request_timeout_seconds", 8)),
                 )
                 response.raise_for_status()
                 data = response.json()
@@ -246,7 +266,7 @@ class DataFeedRouter:
             "errors": errors,
         }
 
-    def _alpha_vantage_quote(self, symbols):
+    def _alpha_vantage_quote(self, symbols, config):
         if not self.alpha_vantage_key:
             return {"status": "not_configured", "detail": "ALPHA_VANTAGE_API_KEY missing", "underlyings": {}}
         quotes = {}
@@ -254,9 +274,9 @@ class DataFeedRouter:
         for symbol in symbols:
             try:
                 response = requests.get(
-                    "https://www.alphavantage.co/query",
+                    config.get("alpha_vantage_endpoint", "https://www.alphavantage.co/query"),
                     params={"function": "GLOBAL_QUOTE", "symbol": symbol, "apikey": self.alpha_vantage_key},
-                    timeout=8,
+                    timeout=float(config.get("request_timeout_seconds", 8)),
                 )
                 response.raise_for_status()
                 data = response.json()
@@ -283,7 +303,7 @@ class DataFeedRouter:
             "errors": errors,
         }
 
-    def _massive_snapshots(self, symbols):
+    def _massive_snapshots(self, symbols, config):
         if not self.massive_key:
             return {"status": "not_configured", "detail": "MASSIVE_API_KEY missing", "underlyings": {}}
         snapshots = {}
@@ -291,9 +311,12 @@ class DataFeedRouter:
         for symbol in symbols:
             try:
                 response = requests.get(
-                    f"https://api.massive.com/v2/snapshot/locale/us/markets/stocks/tickers/{urllib.parse.quote(symbol)}",
+                    config.get(
+                        "massive_endpoint",
+                        "https://api.massive.com/v2/snapshot/locale/us/markets/stocks/tickers/{symbol}",
+                    ).replace("{symbol}", urllib.parse.quote(symbol)),
                     params={"apiKey": self.massive_key},
-                    timeout=8,
+                    timeout=float(config.get("request_timeout_seconds", 8)),
                 )
                 response.raise_for_status()
                 data = response.json()
@@ -325,7 +348,33 @@ class DataFeedRouter:
             "errors": errors,
         }
 
-    def _cboe_option_quotes(self, contracts):
+    def _custom_quotes(self, symbols, source):
+        quotes = {}
+        errors = {}
+        adapter = GenericJsonSource(source)
+        for symbol in symbols:
+            try:
+                quote = adapter.fetch_quote(symbol)
+                bid = safe_float(quote.get("bid"))
+                ask = safe_float(quote.get("ask"))
+                price = safe_float(quote.get("price"))
+                quote.update({
+                    "price": safe_round(price),
+                    "bid": safe_round(bid),
+                    "ask": safe_round(ask),
+                    "mid": safe_round((bid + ask) / 2) if bid and ask else safe_round(price),
+                })
+                quotes[symbol] = quote
+            except Exception as exc:
+                errors[symbol] = sanitize_error(exc, 160)
+        return {
+            "status": "ok" if quotes else "error" if errors else "empty",
+            "detail": f"{len(quotes)}/{len(symbols)} custom quotes",
+            "underlyings": quotes,
+            "errors": errors,
+        }
+
+    def _cboe_option_quotes(self, contracts, config):
         if not contracts:
             return {"status": "empty", "detail": "No contracts selected", "options": {}}
         by_underlying = {}
@@ -338,9 +387,12 @@ class DataFeedRouter:
         for underlying, target_contracts in by_underlying.items():
             try:
                 response = requests.get(
-                    f"https://cdn.cboe.com/api/global/delayed_quotes/options/{urllib.parse.quote(underlying)}.json",
+                    config.get(
+                        "cboe_endpoint",
+                        "https://cdn.cboe.com/api/global/delayed_quotes/options/{underlying}.json",
+                    ).replace("{underlying}", urllib.parse.quote(underlying)),
                     headers=HTTP_HEADERS,
-                    timeout=12,
+                    timeout=float(config.get("request_timeout_seconds", 12)),
                 )
                 response.raise_for_status()
                 payload = response.json()
@@ -378,16 +430,28 @@ class DataFeedRouter:
             "errors": errors,
         }
 
-    def _merge_underlyings(self, symbols, providers):
+    def _provider_priorities(self, config):
+        priorities = {
+            "alpaca": 100,
+            "cboe": 100,
+            "finnhub": 200,
+            "massive": 300,
+            "alpha_vantage": 400,
+        }
+        for source in config.get("custom_sources", []):
+            priorities[source.get("id")] = source.get("priority", 50)
+        return priorities
+
+    def _merge_underlyings(self, symbols, providers, config):
         merged = {}
-        provider_order = ["alpaca", "finnhub", "massive", "alpha_vantage"]
+        priorities = self._provider_priorities(config)
         for symbol in symbols:
             quotes = []
             for provider in providers:
                 quote = (provider.get("underlyings") or {}).get(symbol)
                 if quote:
                     quotes.append(quote)
-            quotes.sort(key=lambda item: provider_order.index(item["provider"]) if item["provider"] in provider_order else 99)
+            quotes.sort(key=lambda item: (priorities.get(item["provider"], 999), item["provider"]))
             merged[symbol] = {
                 "selected": quotes[0] if quotes else None,
                 "sources": quotes,
@@ -410,11 +474,11 @@ class DataFeedRouter:
             }
         return merged
 
-    def _first_ok_provider(self, providers, key):
-        for provider_name in ["alpaca", "cboe", "finnhub", "massive", "alpha_vantage"]:
-            for provider in providers:
-                if provider["provider"] == provider_name and provider.get(key):
-                    return provider_name
+    def _first_ok_provider(self, providers, key, config=None):
+        priorities = self._provider_priorities(config or {})
+        for provider in sorted(providers, key=lambda item: (priorities.get(item["provider"], 999), item["provider"])):
+            if provider.get(key):
+                return provider["provider"]
         return None
 
     def _alpaca_stock_feed(self):
