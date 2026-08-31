@@ -2079,6 +2079,72 @@ button:disabled {
     color: var(--muted);
 }
 
+/* ── Stage Loading Indicators ── */
+.stage-indicator {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    font-size: 10px;
+    font-weight: 700;
+    border-radius: 50%;
+    flex-shrink: 0;
+    margin-left: 6px;
+    vertical-align: middle;
+    transition: all 0.25s ease;
+}
+
+.stage-indicator.is-idle {
+    color: var(--dim);
+    opacity: 0.5;
+}
+
+.stage-indicator.is-running {
+    color: var(--blue);
+    animation: stage-pulse 1.2s ease-in-out infinite;
+}
+
+.stage-indicator.is-done {
+    color: var(--green);
+}
+
+.stage-indicator.is-partial {
+    color: var(--gold);
+}
+
+.stage-indicator.is-blocked {
+    color: var(--red);
+}
+
+@keyframes stage-pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.4; transform: scale(0.85); }
+}
+
+/* Phase card border glow based on stage status */
+[data-stage-status="running"] {
+    border-color: rgba(96, 165, 250, 0.4) !important;
+    box-shadow: 0 0 12px rgba(96, 165, 250, 0.1);
+}
+
+[data-stage-status="done"] {
+    border-color: rgba(52, 211, 153, 0.3) !important;
+}
+
+[data-stage-status="blocked"] {
+    border-color: rgba(248, 113, 113, 0.3) !important;
+}
+
+/* Lane row highlight when running */
+.lane[data-stage-status="running"] {
+    background: rgba(96, 165, 250, 0.04);
+}
+
+.lane[data-stage-status="done"] .lane-icon {
+    filter: drop-shadow(0 0 4px rgba(52, 211, 153, 0.5));
+}
+
 /* ── Compact Phase Cards ── */
 .compact-phase-card {
     display: flex;
@@ -2140,4 +2206,168 @@ button:disabled {
     font-weight: 500;
 }
 
+/* ── Position Manager ── */
+.position-panel {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px;
+}
 
+.position-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+    gap: 8px;
+}
+
+.position-cost {
+    font-size: 11px;
+    color: var(--muted);
+}
+
+.position-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.position-card {
+    background: var(--card-alt);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px;
+}
+
+.pos-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 6px;
+}
+
+.pos-pnl.pos { color: var(--green); }
+.pos-pnl.neg { color: var(--red); }
+
+.pos-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    font-size: 11px;
+    color: var(--muted);
+}
+
+.pos-trigger {
+    color: var(--accent);
+    font-weight: 600;
+}
+
+.pos-reason, .pos-llm {
+    margin-top: 6px;
+    font-size: 11px;
+    color: var(--text);
+    opacity: 0.85;
+}
+
+.pos-llm {
+    font-style: italic;
+    border-left: 2px solid var(--accent);
+    padding-left: 8px;
+}
+
+.cfg-group input[type="checkbox"] {
+    width: 18px;
+    height: 18px;
+    accent-color: var(--accent);
+}
+
+/* ── LLM Intelligence Panel ── */
+.llm-panel {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px;
+}
+
+.llm-status-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+    flex-wrap: wrap;
+}
+
+.llm-status-detail {
+    font-size: 11px;
+    color: var(--muted);
+}
+
+.llm-stage-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 10px;
+}
+
+.llm-stage-chip {
+    font-size: 10px;
+    padding: 3px 8px;
+    border-radius: 5px;
+    border: 1px solid var(--border);
+    background: var(--card-alt);
+    color: var(--muted);
+}
+
+.llm-stage-chip.on {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: rgba(99, 102, 241, 0.12);
+}
+
+.llm-decision-box {
+    font-size: 12px;
+    padding: 8px;
+    margin-bottom: 10px;
+    border-radius: 6px;
+    background: var(--card-alt);
+    border: 1px solid var(--border);
+}
+
+.llm-activity-feed {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 160px;
+    overflow-y: auto;
+}
+
+.llm-activity-row {
+    display: grid;
+    grid-template-columns: 52px 64px 56px 1fr;
+    gap: 6px;
+    font-size: 10px;
+    padding: 4px 6px;
+    border-radius: 4px;
+    background: var(--card-alt);
+}
+
+.llm-activity-row.is-done { border-left: 2px solid var(--green); }
+.llm-activity-row.is-running { border-left: 2px solid var(--accent); }
+.llm-activity-row.is-error { border-left: 2px solid var(--red); }
+.llm-activity-row.is-skipped { border-left: 2px solid var(--muted); opacity: 0.7; }
+
+.portfolio-review {
+    margin-top: 10px;
+    font-size: 11px;
+    padding: 8px;
+    border-radius: 6px;
+    background: rgba(99, 102, 241, 0.08);
+    border: 1px solid var(--border);
+}
+
+.pill-sm.is-warn {
+    border-color: #f59e0b;
+    color: #f59e0b;
+}

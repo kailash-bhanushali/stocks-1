@@ -6,7 +6,7 @@
     <title>Trading Pipeline</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css?v=8">
+    <link rel="stylesheet" href="/static/style.css?v=9">
 </head>
 <body>
     <!-- Top Bar -->
@@ -198,6 +198,37 @@
                 </div>
             </div>
         </section>
+
+        <!-- ── Position Manager ── -->
+        <section class="phase" id="ph-positions">
+            <div class="phase-label">Position Manager</div>
+            <div class="position-panel">
+                <div class="position-header">
+                    <span class="pill-sm" id="position-monitor-status">Idle</span>
+                    <span class="position-cost" id="llm-cost-display">LLM: --</span>
+                </div>
+                <div class="position-list" id="position-list">
+                    <span class="empty-hint">No open positions</span>
+                </div>
+                <div class="portfolio-review" id="portfolio-review-box"></div>
+            </div>
+        </section>
+
+        <!-- ── LLM Intelligence ── -->
+        <section class="phase" id="ph-llm">
+            <div class="phase-label">LLM Intelligence</div>
+            <div class="llm-panel">
+                <div class="llm-status-row">
+                    <span class="pill-sm" id="llm-status-pill">Checking…</span>
+                    <span class="llm-status-detail" id="llm-status-detail">--</span>
+                </div>
+                <div class="llm-stage-grid" id="llm-stage-grid"></div>
+                <div class="llm-decision-box" id="llm-decision-box"></div>
+                <div class="llm-activity-feed" id="llm-activity-feed">
+                    <span class="empty-hint">Run a scan to see LLM activity</span>
+                </div>
+            </div>
+        </section>
     </main>
 
     <!-- Event Log Strip -->
@@ -219,6 +250,7 @@
                 <button class="tab-btn" role="tab" aria-selected="false" data-tab="tab-news">📰 3. News</button>
                 <button class="tab-btn" role="tab" aria-selected="false" data-tab="tab-social">💬 4. Social</button>
                 <button class="tab-btn" role="tab" aria-selected="false" data-tab="tab-fundamentals">📁 5. Fundamentals</button>
+                <button class="tab-btn" role="tab" aria-selected="false" data-tab="tab-llm">🤖 6. LLM</button>
             </div>
 
             <div class="modal-body" id="modal-form-container">
@@ -401,6 +433,6 @@
         </div>
     </div>
 
-    <script src="/static/app.js?v=8"></script>
+    <script src="/static/app.js?v=11"></script>
 </body>
 </html>

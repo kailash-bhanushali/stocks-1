@@ -49,7 +49,10 @@ function render(s) {
     renderResearch(s);
     renderTrader(s);
     renderExecution(s);
+    renderPositions(s);
+    renderLlmIntelligence(s);
     renderEvents(s);
+    renderStageIndicators(s);
 }
 
 // ── Top bar ────────────────────────────────────────────────────
@@ -442,6 +445,7 @@ function renderResearch(s) {
         const parts = [];
         if (themes.length) parts.push(`${themes.length} themes`);
         if (regime) parts.push(regime);
+        if (debate?.llm_powered) parts.push('Claude');
         compactResBadge.textContent = parts.length ? parts.join(' · ') : '--';
     }
 
@@ -524,8 +528,18 @@ function renderTrader(s) {
             const flowInfo = item.flow?.has_unusual_activity
                 ? `\n[Unusual Flow] ${item.flow.flow_sentiment?.toUpperCase() || 'NEUTRAL'} (${item.flow.flow_score ?? item.flow_score ?? 0}/100) · ${item.flow.unusual_count || 0} unusual contract(s) · P/C ratio ${item.flow.put_call_ratio ?? '?'}`
                 : '';
+            const tm = item.trade_management;
+            const tradeInfo = tm
+                ? `\n[Trade Plan] ${tm.max_contracts} contract(s) · $${tm.total_premium} total premium`
+                    + `\n  TP: $${tm.take_profit_price} (+${tm.take_profit_pct}%) · SL: $${tm.stop_loss_price} (-${tm.stop_loss_pct}%)`
+                    + `\n  Trail: ${tm.trailing_stop_pct}% from peak · Breakeven: $${tm.breakeven_price}`
+                    + `\n  Fees: $${tm.estimated_fees} · Slippage est: $${tm.slippage_estimate}`
+                    + `\n  R:R ${tm.risk_reward_ratio}:1 · Max loss $${tm.max_loss_dollars} · Max gain $${tm.max_gain_dollars}`
+                    + (tm.max_hold_days ? `\n  Hold: max ${tm.max_hold_days}d · DTE exit <${tm.dte_exit_threshold}d` : '')
+                    + (tm.cash_used ? `\n  Sizing basis: cash $${tm.cash_used}` : '')
+                : '';
 
-            row.title = `[Why Selected] ${selReason}\n[Score Breakdown] ${scoreBreak}\n[Options Detail] ${optInfo}${intelInfo}${flowInfo}\n\n👉 Click row or '🧠 Intel' button to open Intelligence Drawer`;
+            row.title = `[Why Selected] ${selReason}\n[Score Breakdown] ${scoreBreak}\n[Options Detail] ${optInfo}${intelInfo}${flowInfo}${tradeInfo}\n\n👉 Click row or '🧠 Intel' button to open Intelligence Drawer`;
 
             wlEl.appendChild(row);
         });
@@ -542,8 +556,16 @@ function renderTrader(s) {
     const optEl = $('risk-options');
     if (optEl) {
         const optCount = wl.filter(w => w.options?.selected_contract).length;
-        optEl.querySelector('span').textContent =
-            wl.length ? `${optCount}/${wl.length} contracts valid` : '--';
+        const topTm = wl[0]?.trade_management;
+        const decPlan = s.last_decision?.contract_plan;
+        const plan = decPlan?.max_contracts ? decPlan : topTm;
+        let optText = wl.length ? `${optCount}/${wl.length} contracts valid` : '--';
+        if (plan?.max_contracts) {
+            optText += ` · ${plan.max_contracts} qty · TP +${plan.take_profit_pct ?? '?'}% / SL -${plan.stop_loss_pct ?? '?'}%`;
+            if (plan.max_hold_days) optText += ` · max ${plan.max_hold_days}d hold`;
+            if (plan.risk_reward_ratio) optText += ` · R:R ${plan.risk_reward_ratio}:1`;
+        }
+        optEl.querySelector('span').textContent = optText;
     }
 }
 
@@ -560,8 +582,11 @@ function renderExecution(s) {
         const sp = alpEl.querySelector('span');
         const ok = alp.status === 'ok';
         sp.textContent = ok
-            ? `Paper · $${Number(alp.buying_power || 0).toLocaleString()} buying power`
+            ? `Paper · Cash $${Number(alp.cash || 0).toLocaleString()} (sizing)`
             : (alp.detail || alp.status || '--');
+        sp.title = ok
+            ? `Cash used for position sizing. Buying power $${Number(alp.buying_power || 0).toLocaleString()} is margin — not used.`
+            : '';
         sp.className = ok ? 'ok' : 'warn';
     }
 
@@ -588,13 +613,147 @@ function renderExecution(s) {
         const sp = decEl.querySelector('span');
         if (dec) {
             const approved = String(dec.decision || '').includes('approved');
-            sp.textContent = `${dec.decision} · ${Math.round((dec.confidence || 0) * 100)}%`;
+            let txt = `${dec.decision} · ${Math.round((dec.confidence || 0) * 100)}%`;
+            if (dec.llm_decision?.reasoning) txt += ` · LLM: ${dec.llm_decision.reasoning.slice(0, 60)}…`;
+            sp.textContent = txt;
+            sp.title = dec.llm_decision?.reasoning || dec.reason || '';
             sp.className = approved ? 'ok' : 'warn';
         } else {
             sp.textContent = 'Pending';
             sp.className = '';
         }
     }
+}
+
+function renderPositions(s) {
+    const listEl = $('position-list');
+    const statusEl = $('position-monitor-status');
+    const costEl = $('llm-cost-display');
+    const monitor = s.position_monitor || {};
+    const cost = s.llm_cost || s.research?.token_policy?.session_cost || {};
+
+    if (statusEl) {
+        statusEl.textContent = monitor.status || 'idle';
+        statusEl.className = `pill-sm ${monitor.status === 'running' ? 'is-active' : ''}`;
+    }
+    if (costEl) {
+        const usd = cost.estimated_usd != null ? `$${Number(cost.estimated_usd).toFixed(4)}` : '--';
+        const calls = cost.calls ?? 0;
+        costEl.textContent = `LLM: ${usd} · ${calls} calls`;
+    }
+    if (!listEl) return;
+
+    const positions = (s.positions || []).filter(p => p.status !== 'closed');
+    listEl.replaceChildren();
+    if (!positions.length) {
+        listEl.innerHTML = '<span class="empty-hint">No open positions</span>';
+        return;
+    }
+
+    positions.forEach(pos => {
+        const card = document.createElement('div');
+        card.className = 'position-card';
+        const ev = pos.exit_evaluation || {};
+        const pnl = pos.unrealized_plpc ?? ev.pnl_pct ?? '--';
+        const pnlClass = Number(pnl) >= 0 ? 'pos' : 'neg';
+        const trigger = ev.trigger || (ev.action === 'hold' ? 'monitoring' : ev.action);
+        const llmNote = ev.llm?.reasoning ? `<div class="pos-llm">${escapeHtml(ev.llm.reasoning.slice(0, 120))}</div>` : '';
+        card.innerHTML = `
+            <div class="pos-head">
+                <strong>${escapeHtml(pos.underlying || pos.symbol?.slice(0, 6) || '?')}</strong>
+                <span class="pos-pnl ${pnlClass}">${typeof pnl === 'number' ? pnl.toFixed(1) : pnl}%</span>
+            </div>
+            <div class="pos-meta">
+                <span>Qty ${pos.qty || 1}</span>
+                <span>Entry $${pos.entry_price ?? '?'}</span>
+                <span>DTE ${pos.dte ?? pos.contract_dte ?? '?'}</span>
+                <span class="pos-trigger">${escapeHtml(trigger || '--')}</span>
+            </div>
+            ${ev.reason ? `<div class="pos-reason">${escapeHtml(ev.reason)}</div>` : ''}
+            ${llmNote}
+        `;
+        listEl.appendChild(card);
+    });
+
+    const reviewEl = $('portfolio-review-box');
+    const review = s.portfolio_review || {};
+    if (reviewEl) {
+        if (review.summary && review.status !== 'empty') {
+            reviewEl.innerHTML = `<strong>Portfolio review</strong> (${review.portfolio_health || '?'}/score ${review.health_score ?? '?'})<br>${escapeHtml(review.summary)}`;
+        } else {
+            reviewEl.innerHTML = '';
+        }
+    }
+}
+
+const LLM_STAGE_LABELS = {
+    discovery: 'Discovery',
+    news: 'News',
+    social: 'Social',
+    intelligence: 'Intel',
+    debate: 'Debate',
+    options: 'Options',
+    decision: 'Decision',
+    exit: 'Exit',
+    portfolio: 'Portfolio',
+    cache: 'Cache',
+};
+
+function renderLlmIntelligence(s) {
+    const status = s.llm_status || {};
+    const activity = s.llm_activity || s.research?.llm_activity || [];
+    const pill = $('llm-status-pill');
+    const detail = $('llm-status-detail');
+    const grid = $('llm-stage-grid');
+    const feed = $('llm-activity-feed');
+    const decBox = $('llm-decision-box');
+
+    if (pill) {
+        const ready = status.configured;
+        pill.textContent = ready ? 'LLM Active' : 'LLM Not Ready';
+        pill.className = `pill-sm ${ready ? 'is-active' : 'is-warn'}`;
+    }
+    if (detail) {
+        const cost = status.session_cost || s.llm_cost || {};
+        const usd = cost.estimated_usd != null ? `$${Number(cost.estimated_usd).toFixed(4)}` : '$0';
+        detail.textContent = `${status.reason || '--'} · Session ${usd} · ${cost.calls || 0} calls`;
+    }
+
+    if (grid && status.stages) {
+        grid.replaceChildren();
+        Object.entries(status.stages).forEach(([stage, meta]) => {
+            const chip = document.createElement('span');
+            chip.className = `llm-stage-chip ${meta.enabled ? 'on' : 'off'}`;
+            chip.textContent = LLM_STAGE_LABELS[stage] || stage;
+            chip.title = meta.enabled ? `${stage} LLM enabled` : `${stage} LLM off — rule-based fallback`;
+            grid.appendChild(chip);
+        });
+    }
+
+    if (decBox) {
+        const ld = s.last_decision?.llm_decision;
+        if (ld?.reasoning) {
+            decBox.innerHTML = `<strong>Last trade decision (Opus)</strong><br>${escapeHtml(ld.reasoning)}<br><small>${ld.decision || ''} · confidence ${Math.round((ld.confidence || 0) * 100)}%</small>`;
+        } else {
+            decBox.innerHTML = '<span class="empty-hint">No LLM trade decision yet — fires when TradingView signal is confirmed</span>';
+        }
+    }
+
+    if (!feed) return;
+    feed.replaceChildren();
+    if (!activity.length) {
+        feed.innerHTML = '<span class="empty-hint">Run a scan to see LLM activity per stage</span>';
+        return;
+    }
+    activity.slice(0, 12).forEach(entry => {
+        const row = document.createElement('div');
+        row.className = `llm-activity-row is-${entry.status || 'info'}`;
+        row.innerHTML = `<span class="llm-act-time">${formatTime(entry.time)}</span>`
+            + `<span class="llm-act-stage">${escapeHtml(LLM_STAGE_LABELS[entry.stage] || entry.stage)}</span>`
+            + `<span class="llm-act-status">${escapeHtml(entry.status)}</span>`
+            + `<span class="llm-act-summary">${escapeHtml(entry.summary || entry.error || '')}</span>`;
+        feed.appendChild(row);
+    });
 }
 
 // ── Events ─────────────────────────────────────────────────────
@@ -621,14 +780,106 @@ function renderEvents(s) {
     });
 }
 
+// ── Stage Loading Indicators ───────────────────────────────────
+function renderStageIndicators(s) {
+    const stages = s.stages || [];
+    const stageMap = {};
+    stages.forEach(st => { stageMap[st.id] = st; });
+
+    const phaseMapping = [
+        { elementId: 'ph-sources',       stageIds: ['discovery', 'market', 'sources'] },
+        { elementId: 'compact-selection', stageIds: ['themes', 'watchlist'] },
+        { elementId: 'compact-research',  stageIds: ['research'] },
+        { elementId: 'ph-trader',         stageIds: ['options', 'watchlist'] },
+        { elementId: 'ph-exec',           stageIds: ['execution', 'tradingview', 'decision'] },
+    ];
+
+    const laneMapping = {
+        'lane-discovery': 'discovery',
+        'lane-market':    'market',
+        'lane-news':      'sources',
+        'lane-social':    'sources',
+        'lane-sec':       'sources',
+    };
+
+    phaseMapping.forEach(({ elementId, stageIds }) => {
+        const el = $(elementId);
+        if (!el) return;
+        const relevant = stageIds.map(id => stageMap[id]).filter(Boolean);
+        const status = deriveGroupStatus(relevant);
+        el.setAttribute('data-stage-status', status);
+
+        let indicator = el.querySelector('.stage-indicator');
+        if (!indicator) {
+            indicator = document.createElement('span');
+            indicator.className = 'stage-indicator';
+            const label = el.querySelector('.phase-label') || el.querySelector('.compact-info');
+            if (label) label.appendChild(indicator);
+            else el.appendChild(indicator);
+        }
+        updateIndicator(indicator, status, relevant);
+    });
+
+    Object.entries(laneMapping).forEach(([laneId, stageId]) => {
+        const lane = $(laneId);
+        const stage = stageMap[stageId];
+        if (!lane || !stage) return;
+        lane.setAttribute('data-stage-status', stage.status);
+        let indicator = lane.querySelector('.stage-indicator');
+        if (!indicator) {
+            indicator = document.createElement('span');
+            indicator.className = 'stage-indicator';
+            const badge = lane.querySelector('.lane-badge');
+            if (badge) lane.insertBefore(indicator, badge);
+            else lane.appendChild(indicator);
+        }
+        updateIndicator(indicator, stage.status, [stage]);
+    });
+}
+
+function deriveGroupStatus(stages) {
+    if (!stages.length) return 'idle';
+    if (stages.some(s => s.status === 'running')) return 'running';
+    if (stages.every(s => s.status === 'done')) return 'done';
+    if (stages.some(s => s.status === 'done')) return 'partial';
+    if (stages.some(s => s.status === 'blocked')) return 'blocked';
+    return 'idle';
+}
+
+function updateIndicator(el, status, stages) {
+    const icons = { idle: '○', running: '◌', done: '✓', partial: '◐', blocked: '⚠' };
+    el.className = `stage-indicator is-${status}`;
+    el.textContent = icons[status] || '○';
+    const details = stages.map(s => `${s.label}: ${s.detail || s.status}`).join('\n');
+    el.title = details;
+}
+
 // ── Actions ────────────────────────────────────────────────────
+let _scanPolling = false;
+
 $('btn-scan').addEventListener('click', async () => {
     $('btn-scan').disabled = true;
     $('btn-scan').textContent = '⏳ Scanning...';
     try {
-        await fetch('/api/research/run', { method: 'POST' });
-        await fetchState();
-    } finally {
+        const res = await fetch('/api/research/run', { method: 'POST' });
+        const data = await res.json();
+        if (data.status === 'already_running') {
+            $('btn-scan').disabled = false;
+            $('btn-scan').textContent = '▶ Run Scan';
+            return;
+        }
+        _scanPolling = true;
+        const pollInterval = setInterval(async () => {
+            await fetchState();
+            const status = latestState.status;
+            if (status && status !== 'researching') {
+                clearInterval(pollInterval);
+                _scanPolling = false;
+                $('btn-scan').disabled = false;
+                $('btn-scan').textContent = '▶ Run Scan';
+            }
+        }, 1200);
+    } catch {
         $('btn-scan').disabled = false;
         $('btn-scan').textContent = '▶ Run Scan';
     }
@@ -799,7 +1050,8 @@ const configSectionByTab = {
     'tab-market': 'market',
     'tab-news': 'news',
     'tab-social': 'social',
-    'tab-fundamentals': 'fundamentals'
+    'tab-fundamentals': 'fundamentals',
+    'tab-llm': 'llm',
 };
 
 async function fetchSourcesConfig() {
@@ -873,6 +1125,7 @@ function renderModalTab(tabId) {
     applyNote.textContent = `Currently active · last saved ${updated} · changes apply to the next scan or quote refresh`;
     container.appendChild(applyNote);
 
+    if (sectionKey !== 'llm') {
     // Exact provider and endpoint inventory currently in use.
     const inventoryHead = document.createElement('div');
     inventoryHead.className = 'cfg-row-head';
@@ -951,8 +1204,11 @@ function renderModalTab(tabId) {
         sourceGrid.innerHTML = '<span class="empty-hint">No sources implemented for this section.</span>';
     }
     container.appendChild(sourceGrid);
+    }
 
+    if (sectionKey !== 'llm') {
     renderScoringExplanation(container, sectionKey, section);
+    }
 
     const settingsTitle = document.createElement('h3');
     settingsTitle.className = 'cfg-subtitle';
@@ -963,7 +1219,9 @@ function renderModalTab(tabId) {
     const schema = section.field_schema || {};
     Object.entries(schema).forEach(([key, fieldMeta]) => {
         if (fieldMeta.hidden) return;
+        if (fieldMeta.type === 'object') return;
         const value = section[key];
+        if (value !== null && typeof value === 'object' && !Array.isArray(value)) return;
 
         const group = document.createElement('div');
         group.className = 'cfg-group';
@@ -977,6 +1235,11 @@ function renderModalTab(tabId) {
             input.rows = 2;
             input.value = Array.isArray(value) ? value.join(', ') : String(value || '');
             input.dataset.type = 'list';
+        } else if (fieldMeta.type === 'boolean' || typeof value === 'boolean') {
+            input = document.createElement('input');
+            input.type = 'checkbox';
+            input.checked = Boolean(value);
+            input.dataset.type = 'boolean';
         } else if (fieldMeta.type === 'number' || fieldMeta.type === 'integer' || typeof value === 'number') {
             input = document.createElement('input');
             input.type = 'number';
@@ -1406,6 +1669,8 @@ async function saveConfig(silent = false) {
             let val = input.value;
             if (type === 'list') {
                 val = val.split(',').map(s => s.trim()).filter(Boolean);
+            } else if (type === 'boolean') {
+                val = input.checked;
             } else if (type === 'number' || type === 'integer') {
                 if (val.trim() === '') throw new Error(`${k} requires a number`);
                 val = Number(val);
@@ -1993,21 +2258,26 @@ function renderValuationPanel(d) {
         const daysAway = d.earnings_days_away;
         const timing = d.earnings_timing || '';
         const timingLabel = timing === 'AMC' ? 'After Market Close' : timing === 'BMO' ? 'Before Market Open' : '';
+        const quarter = d.earnings_quarter ? ` ${d.earnings_quarter}` : '';
+        const fy = d.earnings_fiscal_year ? ` FY${d.earnings_fiscal_year}` : '';
         let alertClass = 'earnings-alert-safe';
         let alertIcon = '📅';
-        let alertMsg = `Next Earnings: ${escapeHtml(d.earnings_date)}`;
+        let alertMsg = `Next quarterly earnings${quarter}${fy}: ${escapeHtml(d.earnings_date)}`;
         if (timingLabel) alertMsg += ` (${timingLabel})`;
 
         if (daysAway != null && daysAway >= 0 && daysAway <= 7) {
             alertClass = 'earnings-alert-danger';
             alertIcon = '⚠️';
-            alertMsg += ` — <strong>${daysAway}d away!</strong> IV Crush risk: option premiums may collapse 40–60% post-earnings`;
-        } else if (daysAway != null && daysAway >= 8 && daysAway <= 14) {
+            alertMsg += ` — <strong>${daysAway}d away!</strong> IV crush risk: premiums may collapse 40–60% post-earnings`;
+        } else if (daysAway != null && daysAway >= 8 && daysAway <= 21) {
             alertClass = 'earnings-alert-warn';
             alertIcon = '🔶';
-            alertMsg += ` — <strong>${daysAway}d away</strong> — monitor IV levels before entry`;
-        } else if (daysAway != null) {
-            alertMsg += ` — ${daysAway}d away (safe window)`;
+            alertMsg += ` — <strong>${daysAway}d away</strong> — earnings within option hold window; monitor IV`;
+        } else if (daysAway != null && daysAway >= 0) {
+            alertMsg += ` — ${daysAway}d away`;
+        }
+        if (d.earnings_source) {
+            alertMsg += ` <small>(${escapeHtml(d.earnings_source)})</small>`;
         }
 
         const earningsEl = document.createElement('div');

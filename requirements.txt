@@ -5,3 +5,4 @@ python-dotenv
 pydantic
 requests
 urllib3<2  # Python 3.9 on macOS links LibreSSL; urllib3 2.x warns and is unsupported.
+anthropic

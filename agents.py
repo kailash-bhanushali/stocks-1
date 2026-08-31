@@ -8,12 +8,27 @@ import re
 import statistics
 import threading
 import time
+from typing import Any, Dict
 import urllib.parse
 import xml.etree.ElementTree as ET
 
 import requests
 
 from intelligence_agent import compute_intelligence_scoring, fetch_all_intelligence
+from llm_service import (
+    OmniRouteClient,
+    get_session_cost,
+    llm_debate,
+    llm_discovery_themes,
+    llm_enabled,
+    llm_exit_reasoning,
+    llm_intelligence_synthesis,
+    llm_news_sentiment,
+    llm_options_context,
+    llm_social_sentiment,
+    llm_trade_decision,
+    reset_session_cost,
+)
 from scoring_calibration import CalibrationError, calibrate as calibrate_scoring_weights
 
 from source_adapters import (
@@ -187,12 +202,29 @@ DEFAULT_SOURCES_CONFIG = {
         "option_dte_min": 25,
         "option_dte_max": 65,
         "option_dte_target": 45,
+        "risk_per_trade_pct": 10.0,
+        "max_concurrent_positions": 3,
+        "take_profit_pct": 50.0,
+        "stop_loss_pct": 30.0,
+        "trailing_stop_pct": 20.0,
+        "fee_per_contract": 0.0,
+        "exchange_fee_per_contract": 0.04,
+        "slippage_model": "half_spread",
+        "max_hold_days": 10,
+        "dte_exit_threshold": 14,
+        "theta_exit_pct": 5.0,
+        "stale_trade_days": 5,
+        "stale_trade_pnl_band_pct": 10.0,
         "unusual_flow": {
             "min_vol_oi_ratio": 3.0,
             "min_premium_dollars": 10000,
             "min_open_interest": 50,
             "max_dte": 90,
         },
+        "flow_min_vol_oi_ratio": 3.0,
+        "flow_min_premium_dollars": 10000,
+        "flow_min_open_interest": 50,
+        "flow_max_dte": 90,
         "field_schema": {
             "custom_sources": _field("Custom market sources", "source_list", "Managed through Add Source.", hidden=True),
             "enabled_sources": _field("Enabled market sources", "list", "Comma-separated source IDs. yahoo_chart is the technical-bar source; the others are live quote-router fallbacks.", choices=["yahoo_chart", "alpaca", "cboe", "finnhub", "alpha_vantage", "massive"]),
@@ -229,7 +261,24 @@ DEFAULT_SOURCES_CONFIG = {
             "option_dte_min": _field("Option min DTE", "integer", "Minimum days to expiration for contract selection. Contracts expiring sooner are excluded.", min=1, max=180),
             "option_dte_max": _field("Option max DTE", "integer", "Maximum days to expiration for contract selection. Contracts expiring later are excluded.", min=7, max=365),
             "option_dte_target": _field("Option ideal DTE", "integer", "Ideal days to expiration that receives the highest DTE score. Contracts closer to this value are preferred.", min=1, max=365),
-            "unusual_flow": _field("Unusual options flow config", "object", "Thresholds for the Vol/OI unusual flow scanner. Adjust min_vol_oi_ratio (default 3.0) and min_premium_dollars (default 10000) to tune sensitivity."),
+            "risk_per_trade_pct": _field("Risk per trade (%)", "number", "Maximum percent of account equity risked on one position (stop-loss basis).", min=0.5, max=25),
+            "max_concurrent_positions": _field("Max concurrent positions", "integer", "Maximum number of option positions to hold at once.", min=1, max=10),
+            "take_profit_pct": _field("Take profit (%)", "number", "Exit when option premium rises this percent above entry mid.", min=5, max=500),
+            "stop_loss_pct": _field("Stop loss (%)", "number", "Exit when option premium falls this percent below entry mid.", min=5, max=90),
+            "trailing_stop_pct": _field("Trailing stop (%)", "number", "After profit, trail peak premium by this percent to lock gains.", min=5, max=50),
+            "fee_per_contract": _field("Commission per contract", "number", "Broker commission per contract per leg. Alpaca charges $0 for retail.", min=0, max=10),
+            "exchange_fee_per_contract": _field("Regulatory fee per contract", "number", "ORF ($0.015) + OCC ($0.025) + CAT (~$0.0003) per contract per leg. Alpaca passes these through.", min=0, max=10),
+            "slippage_model": _field("Slippage model", "text", "How to estimate fill slippage. half_spread uses half the bid-ask spread.", choices=["half_spread"]),
+            "max_hold_days": _field("Max hold days", "integer", "Force exit evaluation when position is open longer than this many trading days.", min=1, max=60),
+            "dte_exit_threshold": _field("DTE exit threshold", "integer", "Close position when days-to-expiration falls below this (theta accelerates).", min=1, max=45),
+            "theta_exit_pct": _field("Theta exit (%)", "number", "Exit if daily theta exceeds this percent of current premium value.", min=1, max=25),
+            "stale_trade_days": _field("Stale trade days", "integer", "After this many days with flat P&L, consult LLM for exit decision.", min=1, max=30),
+            "stale_trade_pnl_band_pct": _field("Stale P&L band (%)", "number", "P&L between -X% and +X% is considered stale/flat.", min=1, max=25),
+            "unusual_flow": _field("Unusual options flow config", "object", "Nested config (hidden). Use the individual flow_* fields below instead.", hidden=True),
+            "flow_min_vol_oi_ratio": _field("Flow: min vol/OI ratio", "number", "Minimum volume-to-open-interest ratio to flag as unusual. Higher = fewer but stronger signals.", min=1.0, max=50.0),
+            "flow_min_premium_dollars": _field("Flow: min premium ($)", "integer", "Minimum total premium in dollars for a flow to qualify as unusual.", min=1000, max=1000000),
+            "flow_min_open_interest": _field("Flow: min open interest", "integer", "Minimum OI a contract must have for the vol/OI ratio to be meaningful.", min=1, max=10000),
+            "flow_max_dte": _field("Flow: max DTE", "integer", "Only flag unusual flow on contracts expiring within this many days.", min=7, max=365),
         },
     },
     "news": {
@@ -349,6 +398,40 @@ DEFAULT_SOURCES_CONFIG = {
             "sec_companyfacts_endpoint": _field("SEC company-facts endpoint", "url", "HTTP(S) URL template containing {cik}; the code supplies a zero-padded 10-digit CIK."),
         },
     },
+    "llm": {
+        "title": "LLM: Claude intelligence layer",
+        "description": "Anthropic Claude models for sentiment, debate, trade decisions, and exit reasoning. Requires ANTHROPIC_API_KEY in .env.",
+        "source_inventory": [],
+        "custom_sources": [],
+        "enabled": True,
+        "sonnet_model": "claude-sonnet-4-20250514",
+        "opus_model": "claude-opus-4-20250514",
+        "cache_ttl_seconds": 900,
+        "max_retries": 2,
+        "use_llm_discovery": True,
+        "use_llm_news": True,
+        "use_llm_social": True,
+        "use_llm_intelligence": True,
+        "use_llm_debate": True,
+        "use_llm_options": True,
+        "use_llm_decision": True,
+        "use_llm_exit": True,
+        "field_schema": {
+            "enabled": _field("LLM enabled", "boolean", "Master switch for all LLM calls. When off, pipeline uses rule-based fallbacks."),
+            "sonnet_model": _field("Sonnet model ID", "text", "Fast model for bulk tasks: news, social, intelligence, discovery.", placeholder="claude-sonnet-4-20250514"),
+            "opus_model": _field("Opus model ID", "text", "Deep reasoning model for debate, trade decision, options context, exit.", placeholder="claude-opus-4-20250514"),
+            "cache_ttl_seconds": _field("Response cache TTL (seconds)", "integer", "Cache identical LLM prompts for this duration to save cost.", min=60, max=3600),
+            "max_retries": _field("Max API retries", "integer", "Retry failed LLM calls before falling back to rules.", min=0, max=5),
+            "use_llm_discovery": _field("LLM: Discovery", "boolean", "Suggest emerging themes from headlines beyond static sector baskets."),
+            "use_llm_news": _field("LLM: News sentiment", "boolean", "Batch-analyze headlines per theme with Claude Sonnet."),
+            "use_llm_social": _field("LLM: Social sentiment", "boolean", "Analyze Reddit/HN posts per theme with Claude Sonnet."),
+            "use_llm_intelligence": _field("LLM: Intelligence", "boolean", "Synthesize insider/congress/earnings signals holistically."),
+            "use_llm_debate": _field("LLM: Research debate", "boolean", "Run real bull/bear/risk adversarial debate with Claude Opus."),
+            "use_llm_options": _field("LLM: Options context", "boolean", "Add earnings/catalyst awareness to contract selection."),
+            "use_llm_decision": _field("LLM: Trade decision", "boolean", "Final go/no-go reasoning after risk pre-filters pass."),
+            "use_llm_exit": _field("LLM: Exit reasoning", "boolean", "Evaluate ambiguous exits (stale trades, time-based) with Opus."),
+        },
+    },
 }
 
 
@@ -359,6 +442,16 @@ class SourcesConfigValidationError(ValueError):
 def _validate_config_value(section_key, field_key, value, meta):
     field_type = meta.get("type", "text")
     label = f"{section_key}.{field_key}"
+    if field_type == "boolean":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in ("true", "1", "yes", "on"):
+                return True
+            if lowered in ("false", "0", "no", "off"):
+                return False
+        raise SourcesConfigValidationError(f"{label} must be true or false")
     if field_type == "object":
         if not isinstance(value, dict):
             raise SourcesConfigValidationError(f"{label} must be an object")
@@ -781,23 +874,6 @@ def timed_agent(agent_id, label, fn):
     if error:
         run["error"] = error
     return run, payload
-
-
-class OmniRouteClient:
-    """
-    Reserved for later LLM routing. The current production path is rule-based so
-    research scans do not spend tokens by default.
-    """
-    def __init__(self, endpoint="https://api.omniroute.dev/v1"):
-        self.endpoint = endpoint
-
-    def generate_response(self, prompt: str, model: str = "disabled") -> str:
-        return json.dumps({
-            "model": model,
-            "prompt_chars": len(prompt),
-            "generated_at": utc_now(),
-            "mode": "disabled_for_low_cost"
-        })
 
 
 class YahooChartProvider:
@@ -1304,7 +1380,7 @@ class SectorDiscoveryAgent:
 
 
 class NewsAgent:
-    def run(self, themes):
+    def run(self, themes, llm_client=None):
         config = get_sources_config()["news"]
         enabled_sources = config["enabled_sources"]
         custom_sources = [
@@ -1351,18 +1427,32 @@ class NewsAgent:
             selected = deduped[:config["articles_per_theme"]]
             items_by_theme[theme["name"]] = selected
             all_titles.extend(item["title"] for item in selected)
+        theme_sentiments = {}
+        llm_summaries = {}
+        if llm_client and llm_enabled("news"):
+            for theme in themes:
+                items = items_by_theme.get(theme["name"], [])
+                result = llm_news_sentiment(theme["name"], items, llm_client)
+                if result and result.get("sentiment_score") is not None:
+                    theme_sentiments[theme["name"]] = int(result["sentiment_score"])
+                    llm_summaries[theme["name"]] = result
         status = "disabled" if not enabled_sources and not custom_sources else "degraded" if errors else "ok"
+        base_sentiment = sentiment_score(
+            all_titles,
+            config["positive_keywords"],
+            config["negative_keywords"],
+            config["sentiment_word_weight"],
+        )
+        if theme_sentiments:
+            base_sentiment = int(sum(theme_sentiments.values()) / len(theme_sentiments))
         return {
             "summary": f"News sources returned {sum(len(v) for v in items_by_theme.values())} articles",
             "source": " + ".join(sources_used) if sources_used else "none",
             "sources_used": sources_used,
             "items_by_theme": items_by_theme,
-            "sentiment": sentiment_score(
-                all_titles,
-                config["positive_keywords"],
-                config["negative_keywords"],
-                config["sentiment_word_weight"],
-            ),
+            "sentiment": base_sentiment,
+            "theme_sentiments": theme_sentiments,
+            "llm_summaries": llm_summaries,
             "errors": errors,
             "status": status,
         }
@@ -1425,7 +1515,7 @@ class NewsAgent:
 
 
 class SocialSentimentAgent:
-    def run(self, themes):
+    def run(self, themes, llm_client=None):
         config = get_sources_config()["social"]
         enabled_sources = config["enabled_sources"]
         custom_sources = [
@@ -1471,18 +1561,32 @@ class SocialSentimentAgent:
             selected = deduped[:config["items_per_theme"]]
             items_by_theme[theme["name"]] = selected
             all_titles.extend(item["title"] for item in selected)
+        theme_sentiments = {}
+        llm_summaries = {}
+        if llm_client and llm_enabled("social"):
+            for theme in themes:
+                items = items_by_theme.get(theme["name"], [])
+                result = llm_social_sentiment(theme["name"], items, llm_client)
+                if result and result.get("sentiment_score") is not None:
+                    theme_sentiments[theme["name"]] = int(result["sentiment_score"])
+                    llm_summaries[theme["name"]] = result
         status = "disabled" if not enabled_sources and not custom_sources else "degraded" if errors else "ok"
+        base_sentiment = sentiment_score(
+            all_titles,
+            config["positive_keywords"],
+            config["negative_keywords"],
+            config["sentiment_word_weight"],
+        )
+        if theme_sentiments:
+            base_sentiment = int(sum(theme_sentiments.values()) / len(theme_sentiments))
         return {
             "summary": f"Social/news-discussion proxy returned {sum(len(v) for v in items_by_theme.values())} posts",
             "source": " + ".join(sources_used) if sources_used else "none",
             "sources_used": sources_used,
             "items_by_theme": items_by_theme,
-            "sentiment": sentiment_score(
-                all_titles,
-                config["positive_keywords"],
-                config["negative_keywords"],
-                config["sentiment_word_weight"],
-            ),
+            "sentiment": base_sentiment,
+            "theme_sentiments": theme_sentiments,
+            "llm_summaries": llm_summaries,
             "errors": errors,
             "status": status,
         }
@@ -1850,10 +1954,10 @@ class UnusualOptionsFlowAgent:
                 "errors": {},
             }
         flow_config = config.get("unusual_flow", {})
-        min_vol_oi = float(flow_config.get("min_vol_oi_ratio", 3.0))
-        min_premium = float(flow_config.get("min_premium_dollars", 10000))
-        min_oi = int(flow_config.get("min_open_interest", 50))
-        max_dte = int(flow_config.get("max_dte", 90))
+        min_vol_oi = float(config.get("flow_min_vol_oi_ratio", flow_config.get("min_vol_oi_ratio", 3.0)))
+        min_premium = float(config.get("flow_min_premium_dollars", flow_config.get("min_premium_dollars", 10000)))
+        min_oi = int(config.get("flow_min_open_interest", flow_config.get("min_open_interest", 50)))
+        max_dte = int(config.get("flow_max_dte", flow_config.get("max_dte", 90)))
 
         flow_signals = {}
         errors = {}
@@ -2033,10 +2137,16 @@ class ResearcherAgent:
         self.flow_agent = UnusualOptionsFlowAgent()
         self.discovery_agent = SectorDiscoveryAgent()
 
-    def scan_market(self, market_digest: str = "") -> dict:
+    def scan_market(self, market_digest: str = "", on_stage=None) -> dict:
+        def _stage(stage_id, status, detail):
+            if on_stage:
+                on_stage(stage_id, status, detail)
+
+        reset_session_cost()
         scan_config = get_sources_config()
         # ── Phase 1: Discovery ─────────────────────────────────
         agent_runs = []
+        _stage("discovery", "running", "Scanning sector ETF momentum via Alpaca + Yahoo")
 
         alpaca_run, alpaca = timed_agent(
             "alpaca", "Alpaca Discovery Agent", self.alpaca_agent.run
@@ -2059,12 +2169,16 @@ class ResearcherAgent:
             for symbol in (theme["tickers"] + theme["etfs"])
         } | set(alpaca_extras) | set(scan_config["market"]["benchmark_symbols"]))
 
+        _stage("discovery", "done", f"{discovery.get('discovery_metadata', {}).get('themes_active', '?')} themes from {len(universe_symbols)} symbols")
+        _stage("market", "running", f"Loading bars for {len(universe_symbols)} symbols")
+        _stage("sources", "running", "Fetching news + social sentiment")
+
         # ── Phase 2: Deep Analysis ─────────────────────────────
         with ThreadPoolExecutor(max_workers=5) as executor:
             futures = {
                 executor.submit(timed_agent, "market", "Market Data Agent", lambda: self.market_agent.run(universe_symbols)): "market",
-                executor.submit(timed_agent, "news", "News Agent", lambda: self.news_agent.run(active_themes)): "news",
-                executor.submit(timed_agent, "social", "Social Sentiment Agent", lambda: self.social_agent.run(active_themes)): "social",
+                executor.submit(timed_agent, "news", "News Agent", lambda: self.news_agent.run(active_themes, self.llm)): "news",
+                executor.submit(timed_agent, "social", "Social Sentiment Agent", lambda: self.social_agent.run(active_themes, self.llm)): "social",
             }
             results = {"alpaca": alpaca}
             for future in as_completed(futures):
@@ -2072,16 +2186,42 @@ class ResearcherAgent:
                 run, payload = future.result()
                 agent_runs.append(run)
                 results[key] = payload
+                if key == "market":
+                    _stage("market", "done", f"{payload.get('symbols_loaded', '?')} symbols loaded ({run.get('duration_ms', '?')}ms)")
+                elif key in ("news", "social"):
+                    done_sources = sum(1 for k in ("news", "social") if k in results and k != "alpaca")
+                    if done_sources >= 2:
+                        _stage("sources", "done", f"News + Social sentiment loaded")
 
         market = results.get("market", {})
         news = results.get("news", {})
         social = results.get("social", {})
+
+        if llm_enabled("discovery") and self.llm:
+            all_headlines = []
+            for items in (news.get("items_by_theme") or {}).values():
+                all_headlines.extend(item.get("title", "") for item in items if item.get("title"))
+            existing = [t["name"] for t in active_themes]
+            discovery_llm = llm_discovery_themes(all_headlines, existing, self.llm)
+            for theme_suggestion in (discovery_llm.get("themes") or [])[:3]:
+                tickers = [str(t).upper() for t in (theme_suggestion.get("tickers") or []) if t]
+                if tickers and theme_suggestion.get("name"):
+                    active_themes.append({
+                        "name": theme_suggestion["name"],
+                        "tickers": tickers[:6],
+                        "etfs": [],
+                        "keywords": ["llm discovery"],
+                        "llm_reasoning": theme_suggestion.get("reasoning", ""),
+                    })
 
         themes = self._rank_themes(market, news, social, active_themes, scan_config)
         preliminary = self._rank_preliminary_candidates(
             themes, market, news, social, alpaca, active_themes, scan_config
         )
         top_for_deep_checks = preliminary[:scan_config["fundamentals"]["max_symbols"]]
+
+        _stage("research", "running", f"Deep-checking {len(top_for_deep_checks)} candidates: fundamentals + options + flow")
+        _stage("options", "running", "Validating option contracts via CBOE")
 
         deep_check_symbols = [item["ticker"] for item in top_for_deep_checks]
         with ThreadPoolExecutor(max_workers=3) as executor:
@@ -2110,6 +2250,13 @@ class ResearcherAgent:
                 run, payload = future.result()
                 agent_runs.append(run)
                 results[key] = payload
+                if key == "fundamentals":
+                    _stage("research", "partial", f"Fundamentals done ({run.get('duration_ms', '?')}ms), options still running")
+                elif key == "options":
+                    _stage("options", "done", f"Options validated ({run.get('duration_ms', '?')}ms)")
+
+        _stage("research", "running", "Building watchlist and bull/bear debate")
+        _stage("watchlist", "running", "Scoring and ranking candidates")
 
         watchlist = self._build_watchlist(
             preliminary,
@@ -2119,6 +2266,11 @@ class ResearcherAgent:
         )
         debate = self._debate_summary(themes, watchlist, market)
         agent_runs.extend(self._decision_agent_runs(debate, watchlist))
+
+        top_tickers = ", ".join(w["ticker"] for w in watchlist[:6]) or "none"
+        _stage("research", "done", f"Debate complete — {len(watchlist)} candidates ranked")
+        _stage("themes", "done", f"{len(themes)} themes ranked")
+        _stage("watchlist", "done", f"Watching {top_tickers}")
 
         return {
             "run_id": datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"),
@@ -2185,9 +2337,10 @@ class ResearcherAgent:
                 },
             },
             "token_policy": {
-                "research_model": "none",
-                "final_decision_model": "none",
-                "reason": "Rule-based pipeline uses live data sources first; LLM routing is disabled by default for low cost."
+                "research_model": get_sources_config().get("llm", {}).get("sonnet_model", "claude-sonnet-4-20250514"),
+                "final_decision_model": get_sources_config().get("llm", {}).get("opus_model", "claude-opus-4-20250514"),
+                "llm_enabled": get_sources_config().get("llm", {}).get("enabled", True),
+                "session_cost": get_session_cost(),
             }
         }
 
@@ -2203,8 +2356,12 @@ class ResearcherAgent:
             volume = average([item.get("volume_ratio") for item in ticker_metrics])
             news_items = news.get("items_by_theme", {}).get(theme["name"], [])
             social_items = social.get("items_by_theme", {}).get(theme["name"], [])
-            news_score = self._configured_sentiment(news_items, scan_config["news"])
-            social_score = self._configured_sentiment(social_items, scan_config["social"])
+            news_score = news.get("theme_sentiments", {}).get(theme["name"])
+            if news_score is None:
+                news_score = self._configured_sentiment(news_items, scan_config["news"])
+            social_score = social.get("theme_sentiments", {}).get(theme["name"])
+            if social_score is None:
+                social_score = self._configured_sentiment(social_items, scan_config["social"])
             relative = (ret20 or 0) - spy_return
             strength = clamp(
                 45
@@ -2331,6 +2488,12 @@ class ResearcherAgent:
                             "bear_catalysts": [],
                         }
 
+        if llm_enabled("intelligence") and self.llm:
+            for sym, intel_data in intel_by_symbol.items():
+                llm_intel = llm_intelligence_synthesis(sym, intel_data, self.llm)
+                if llm_intel and llm_intel.get("intelligence_score") is not None:
+                    intel_by_symbol[sym] = {**intel_data, **llm_intel, "llm_enhanced": True}
+
         watchlist = []
         for item in shortlisted:
             option_validation = option_by_symbol.get(item["ticker"], {
@@ -2372,6 +2535,20 @@ class ResearcherAgent:
 
             risk_notes = []
             selected_contract = option_validation.get("selected_contract")
+            if selected_contract and llm_enabled("options") and self.llm:
+                catalysts = intel.get("bull_catalysts", []) + intel.get("bear_catalysts", [])
+                llm_opt = llm_options_context(
+                    item["ticker"],
+                    [selected_contract],
+                    catalysts[:5],
+                    self.llm,
+                )
+                if llm_opt.get("recommended_symbol"):
+                    option_validation = {**option_validation, "llm_context": llm_opt}
+                elif llm_opt.get("adjustment") == "avoid":
+                    risk_notes.append(f"LLM: avoid — {llm_opt.get('reasoning', '')[:80]}")
+                elif llm_opt.get("earnings_warning"):
+                    risk_notes.append("LLM: earnings IV crush risk flagged")
             if selected_contract:
                 if selected_contract["spread_pct"] > 18:
                     risk_notes.append("Wide option spread")
@@ -2413,6 +2590,7 @@ class ResearcherAgent:
             )
 
             enriched = dict(item)
+            trade_mgmt = compute_trade_management(selected_contract) if selected_contract else None
             enriched.update({
                 "score": int(score),
                 "fundamental_score": int(fundamental_score),
@@ -2425,6 +2603,7 @@ class ResearcherAgent:
                 "risk_notes": risk_notes,
                 "selection_reason": selection_reason,
                 "score_breakdown": score_breakdown,
+                "trade_management": trade_mgmt,
             })
             watchlist.append(enriched)
         return sorted(watchlist, key=lambda item: item["score"], reverse=True)[:8]
@@ -2433,6 +2612,43 @@ class ResearcherAgent:
         top_theme = themes[0] if themes else {}
         spy = market.get("metrics", {}).get("SPY", {})
         qqq = market.get("metrics", {}).get("QQQ", {})
+
+        if llm_enabled("debate") and self.llm:
+            context = {
+                "top_theme": top_theme,
+                "watchlist": [
+                    {
+                        "ticker": w["ticker"],
+                        "score": w.get("score"),
+                        "bias": w.get("bias"),
+                        "contract": (w.get("options") or {}).get("selected_contract"),
+                        "intelligence": w.get("intelligence"),
+                        "flow": w.get("flow"),
+                    }
+                    for w in watchlist[:6]
+                ],
+                "spy": spy,
+                "qqq": qqq,
+            }
+            llm_result = llm_debate(context, self.llm)
+            if llm_result and llm_result.get("bull") and not llm_result.get("error"):
+                risk = llm_result.get("risk") or {}
+                if isinstance(risk, str):
+                    risk = {"market_regime": "caution", "notes": risk}
+                return {
+                    "bull": llm_result.get("bull", [])[:6],
+                    "bear": llm_result.get("bear", [])[:6],
+                    "risk": {
+                        "market_regime": risk.get("market_regime", "caution" if not spy.get("above_sma50") else "risk_on"),
+                        "spy_trend_score": spy.get("trend_score"),
+                        "qqq_trend_score": qqq.get("trend_score"),
+                        "max_option_premium": float(os.getenv("MAX_OPTION_PREMIUM", "1000")),
+                        "notes": risk.get("notes", ""),
+                    },
+                    "manager": llm_result.get("manager", "LLM debate complete."),
+                    "llm_powered": True,
+                }
+
         bull_points = []
         bear_points = []
         if top_theme:
@@ -2649,11 +2865,115 @@ class TechnicalConfirmationAgent:
         }
 
 
+def compute_trade_management(contract, account_context=None):
+    """Size a position and compute exit levels, fees, and risk/reward from config."""
+    if not contract:
+        return None
+
+    mkt_cfg = get_sources_config().get("market", {})
+    risk_pct = float(mkt_cfg.get("risk_per_trade_pct", 10.0))
+    stop_loss_pct = float(mkt_cfg.get("stop_loss_pct", 30.0))
+    take_profit_pct = float(mkt_cfg.get("take_profit_pct", 50.0))
+    trailing_stop_pct = float(mkt_cfg.get("trailing_stop_pct", 20.0))
+    max_hold_days = int(mkt_cfg.get("max_hold_days", 10))
+    dte_exit_threshold = int(mkt_cfg.get("dte_exit_threshold", 14))
+    theta_exit_pct = float(mkt_cfg.get("theta_exit_pct", 5.0))
+    stale_trade_days = int(mkt_cfg.get("stale_trade_days", 5))
+    stale_pnl_band = float(mkt_cfg.get("stale_trade_pnl_band_pct", 10.0))
+    fee_per_contract = float(mkt_cfg.get("fee_per_contract", 0.65))
+    exchange_fee = float(mkt_cfg.get("exchange_fee_per_contract", 0.30))
+    max_contract_cap = 10
+    max_concurrent = int(mkt_cfg.get("max_concurrent_positions", 3))
+    max_premium_env = float(os.getenv("MAX_OPTION_PREMIUM", "1000"))
+
+    premium = float(contract.get("premium") or 0)
+    mid = contract.get("mid")
+    if mid is not None:
+        mid = float(mid)
+    elif premium > 0:
+        mid = premium / 100
+    else:
+        bid = float(contract.get("bid") or 0)
+        ask = float(contract.get("ask") or 0)
+        mid = (bid + ask) / 2 if bid and ask else 0
+
+    account_context = account_context or {}
+    cash = account_context.get("cash")
+    try:
+        equity = float(cash) if cash not in (None, "") else None
+    except (TypeError, ValueError):
+        equity = None
+    if equity is None:
+        equity = max_premium_env * max_concurrent
+
+    risk_budget = equity * (risk_pct / 100)
+    max_loss_per_contract = premium * (stop_loss_pct / 100) if premium > 0 else 0
+
+    if max_loss_per_contract <= 0:
+        qty = 1
+    else:
+        qty = max(1, min(max_contract_cap, int(math.floor(risk_budget / max_loss_per_contract))))
+
+    if premium > 0 and equity:
+        affordable = int(math.floor((equity * 0.95) / premium))
+        qty = max(1, min(qty, affordable))
+
+    fees_per_leg = fee_per_contract + exchange_fee
+    total_fees = qty * 2 * fees_per_leg
+
+    bid = float(contract.get("bid") or 0)
+    ask = float(contract.get("ask") or 0)
+    spread_pct = float(contract.get("spread_pct") or 0)
+    if bid and ask:
+        slippage_per_contract = ((ask - bid) / 2) * 100
+    elif mid and spread_pct:
+        slippage_per_contract = mid * (spread_pct / 100) * 100
+    else:
+        slippage_per_contract = 0
+    slippage_estimate = slippage_per_contract * qty
+
+    take_profit_price = safe_round(mid * (1 + take_profit_pct / 100)) if mid else None
+    stop_loss_price = safe_round(mid * (1 - stop_loss_pct / 100)) if mid else None
+    breakeven_price = safe_round(mid + (total_fees / (qty * 100))) if mid and qty else None
+
+    max_loss_dollars = max_loss_per_contract * qty + total_fees + slippage_estimate
+    max_gain_dollars = premium * qty * (take_profit_pct / 100) - total_fees - slippage_estimate
+
+    return {
+        "max_contracts": qty,
+        "total_premium": safe_round(premium * qty),
+        "mid_price": safe_round(mid),
+        "take_profit_pct": take_profit_pct,
+        "stop_loss_pct": stop_loss_pct,
+        "trailing_stop_pct": trailing_stop_pct,
+        "take_profit_price": take_profit_price,
+        "stop_loss_price": stop_loss_price,
+        "estimated_fees": safe_round(total_fees),
+        "slippage_estimate": safe_round(slippage_estimate),
+        "breakeven_price": breakeven_price,
+        "risk_reward_ratio": safe_round(take_profit_pct / stop_loss_pct, 2) if stop_loss_pct else None,
+        "max_loss_dollars": safe_round(max_loss_dollars),
+        "max_gain_dollars": safe_round(max_gain_dollars),
+        "risk_budget": safe_round(risk_budget),
+        "equity_used": safe_round(equity),
+        "cash_used": safe_round(equity),
+        "sizing_basis": "cash",
+        "risk_per_trade_pct": risk_pct,
+        "max_concurrent_positions": max_concurrent,
+        "max_hold_days": max_hold_days,
+        "dte_exit_threshold": dte_exit_threshold,
+        "theta_exit_pct": theta_exit_pct,
+        "stale_trade_days": stale_trade_days,
+        "stale_trade_pnl_band_pct": stale_pnl_band,
+        "contract_dte": contract.get("dte"),
+    }
+
+
 class TraderAgent:
     def __init__(self, llm_client: OmniRouteClient = None):
         self.llm = llm_client or OmniRouteClient()
 
-    def evaluate_trade(self, webhook_signal: dict, research_context: dict, technical_context: dict) -> dict:
+    def evaluate_trade(self, webhook_signal: dict, research_context: dict, technical_context: dict, account_context: dict = None) -> dict:
         ticker = str(webhook_signal.get("ticker", "")).upper()
         watch = next(
             (item for item in research_context.get("watchlist", []) if item["ticker"] == ticker),
@@ -2667,7 +2987,7 @@ class TraderAgent:
                 "risk_checks": [],
             }
         contract = watch.get("options", {}).get("selected_contract")
-        risk_checks = self._risk_checks(watch, contract, research_context)
+        risk_checks = self._risk_checks(watch, contract, research_context, account_context)
         failed = [check for check in risk_checks if check["status"] == "fail"]
         warnings = [check for check in risk_checks if check["status"] == "warn"]
         if failed:
@@ -2682,7 +3002,58 @@ class TraderAgent:
         if warnings:
             confidence = max(0, confidence - 0.08 * len(warnings))
         is_real_tradingview = bool(technical_context.get("is_real_tradingview"))
-        return {
+        trade_mgmt = compute_trade_management(contract, account_context)
+        contract_plan = {
+            "instrument": "option",
+            "symbol": contract.get("symbol") if contract else None,
+            "type": contract.get("type") if contract else watch["bias"],
+            "expiration": contract.get("expiration") if contract else None,
+            "strike": contract.get("strike") if contract else None,
+            "premium": contract.get("premium") if contract else None,
+            "execution_phase": "disabled_until_alpaca_phase",
+        }
+        if trade_mgmt:
+            contract_plan.update(trade_mgmt)
+        else:
+            contract_plan["max_contracts"] = 1
+
+        llm_decision = None
+        if llm_enabled("decision") and self.llm:
+            llm_context = {
+                "ticker": ticker,
+                "watch": {
+                    "score": watch.get("score"),
+                    "bias": watch.get("bias"),
+                    "theme": watch.get("theme"),
+                    "intelligence": watch.get("intelligence"),
+                    "flow": watch.get("flow"),
+                },
+                "contract": contract,
+                "trade_management": trade_mgmt,
+                "risk_checks": risk_checks,
+                "technical": technical_context,
+                "debate": research_context.get("debate"),
+                "account": account_context,
+            }
+            llm_decision = llm_trade_decision(llm_context, self.llm)
+            if llm_decision and not llm_decision.get("error"):
+                if llm_decision.get("decision") == "skip":
+                    return {
+                        "decision": "skip",
+                        "confidence": safe_round(float(llm_decision.get("confidence", confidence)), 3),
+                        "reason": llm_decision.get("reasoning", "LLM recommended skip."),
+                        "risk_checks": risk_checks,
+                        "contract_plan": contract_plan,
+                        "llm_decision": llm_decision,
+                    }
+                size_mult = float(llm_decision.get("size_multiplier", 1.0) or 1.0)
+                if trade_mgmt and size_mult < 1.0:
+                    adjusted = max(1, int(math.floor(trade_mgmt["max_contracts"] * size_mult)))
+                    contract_plan["max_contracts"] = adjusted
+                    contract_plan["llm_size_adjusted"] = True
+                confidence = float(llm_decision.get("confidence", confidence) or confidence)
+
+        result = {
             "decision": "approved_for_paper_order" if is_real_tradingview else "test_plan_only",
             "confidence": safe_round(confidence, 3),
             "reason": (
@@ -2691,19 +3062,15 @@ class TraderAgent:
                 else "Local test signal matched research and options checks; wait for verified TradingView before real paper approval."
             ),
             "risk_checks": risk_checks,
-            "contract_plan": {
-                "instrument": "option",
-                "symbol": contract.get("symbol") if contract else None,
-                "type": contract.get("type") if contract else watch["bias"],
-                "expiration": contract.get("expiration") if contract else None,
-                "strike": contract.get("strike") if contract else None,
-                "premium": contract.get("premium") if contract else None,
-                "max_contracts": 1,
-                "execution_phase": "disabled_until_alpaca_phase",
-            }
+            "contract_plan": contract_plan,
         }
+        if llm_decision:
+            result["llm_decision"] = llm_decision
+            if llm_decision.get("reasoning"):
+                result["reason"] = llm_decision["reasoning"][:300]
+        return result
 
-    def _risk_checks(self, watch, contract, research_context):
+    def _risk_checks(self, watch, contract, research_context, account_context=None):
         checks = []
         if not contract:
             checks.append({"name": "contract", "status": "fail", "message": "No validated options contract selected."})
@@ -2724,7 +3091,7 @@ class TraderAgent:
             "status": "pass" if contract["open_interest"] >= 100 else "warn",
             "message": f"Open interest {contract['open_interest']}",
         })
-        mkt_cfg = sources_config.get("market", {})
+        mkt_cfg = get_sources_config().get("market", {})
         dte_min = int(mkt_cfg.get("option_dte_min", 25))
         dte_max = int(mkt_cfg.get("option_dte_max", 65))
         checks.append({
@@ -2732,6 +3099,33 @@ class TraderAgent:
             "status": "pass" if dte_min <= contract["dte"] <= dte_max else "fail",
             "message": f"{contract['dte']} DTE (allowed {dte_min}-{dte_max})",
         })
+        max_positions = int(mkt_cfg.get("max_concurrent_positions", 3))
+        watchlist = research_context.get("watchlist", [])
+        rank = next((i for i, item in enumerate(watchlist) if item.get("ticker") == watch.get("ticker")), None)
+        if rank is not None and rank >= max_positions:
+            checks.append({
+                "name": "watchlist_rank",
+                "status": "fail",
+                "message": f"Rank #{rank + 1} exceeds max concurrent slots ({max_positions})",
+            })
+        open_positions = 0
+        if account_context:
+            try:
+                open_positions = int(account_context.get("open_option_positions", 0))
+            except (TypeError, ValueError):
+                open_positions = 0
+        if open_positions >= max_positions:
+            checks.append({
+                "name": "concurrent_positions",
+                "status": "fail",
+                "message": f"{open_positions} open positions at max ({max_positions})",
+            })
+        else:
+            checks.append({
+                "name": "concurrent_positions",
+                "status": "pass",
+                "message": f"{open_positions}/{max_positions} position slots used",
+            })
         flow = watch.get("flow", {})
         if flow.get("has_unusual_activity"):
             flow_sentiment = flow.get("flow_sentiment", "neutral")
@@ -2756,3 +3150,177 @@ class TraderAgent:
             "message": f"Watchlist score {watch['score']}/100",
         })
         return checks
+
+
+class PositionManager:
+    """Tracks open option positions and evaluates exit conditions."""
+
+    def __init__(self, llm_client: OmniRouteClient = None):
+        self.llm = llm_client or OmniRouteClient()
+        self._positions: Dict[str, Dict[str, Any]] = {}
+        self._lock = threading.RLock()
+
+    def register_position(self, position: Dict[str, Any]) -> Dict[str, Any]:
+        symbol = position.get("symbol") or position.get("option_symbol")
+        if not symbol:
+            raise ValueError("Position requires symbol")
+        entry = {
+            "symbol": symbol,
+            "underlying": position.get("underlying"),
+            "qty": int(position.get("qty", 1)),
+            "entry_price": float(position.get("entry_price") or position.get("entry_mid") or 0),
+            "entry_time": position.get("entry_time") or utc_now(),
+            "peak_price": float(position.get("entry_price") or position.get("entry_mid") or 0),
+            "trade_plan": position.get("trade_plan") or {},
+            "contract_dte": position.get("contract_dte"),
+            "status": "open",
+        }
+        with self._lock:
+            self._positions[symbol] = entry
+        return entry
+
+    def sync_from_alpaca(self, alpaca_positions: list) -> None:
+        with self._lock:
+            for pos in alpaca_positions:
+                symbol = pos.get("symbol")
+                if not symbol:
+                    continue
+                if symbol not in self._positions:
+                    self._positions[symbol] = {
+                        "symbol": symbol,
+                        "underlying": pos.get("underlying"),
+                        "qty": int(pos.get("qty", 1)),
+                        "entry_price": float(pos.get("avg_entry_price") or 0),
+                        "entry_time": pos.get("opened_at") or utc_now(),
+                        "peak_price": float(pos.get("current_price") or pos.get("avg_entry_price") or 0),
+                        "trade_plan": {},
+                        "contract_dte": pos.get("dte"),
+                        "status": "open",
+                        "synced_from_alpaca": True,
+                    }
+
+    def list_positions(self) -> list:
+        with self._lock:
+            return list(self._positions.values())
+
+    def close_position_record(self, symbol: str, reason: str = "") -> None:
+        with self._lock:
+            if symbol in self._positions:
+                self._positions[symbol]["status"] = "closed"
+                self._positions[symbol]["close_reason"] = reason
+                self._positions[symbol]["closed_at"] = utc_now()
+
+    def evaluate_exit(self, position: dict, market_quote: dict, llm_client=None) -> Dict[str, Any]:
+        mkt_cfg = get_sources_config().get("market", {})
+        plan = position.get("trade_plan") or {}
+        entry = float(position.get("entry_price") or 0)
+        current = float(market_quote.get("mid") or market_quote.get("current_price") or 0)
+        if current <= 0:
+            current = float(market_quote.get("last") or 0)
+        if entry <= 0 or current <= 0:
+            return {"action": "hold", "reason": "insufficient_price_data"}
+
+        peak = max(float(position.get("peak_price") or entry), current)
+        position["peak_price"] = peak
+        pnl_pct = ((current - entry) / entry) * 100 if entry else 0
+
+        tp_pct = float(plan.get("take_profit_pct", mkt_cfg.get("take_profit_pct", 50)))
+        sl_pct = float(plan.get("stop_loss_pct", mkt_cfg.get("stop_loss_pct", 30)))
+        trail_pct = float(plan.get("trailing_stop_pct", mkt_cfg.get("trailing_stop_pct", 20)))
+        max_hold = int(plan.get("max_hold_days", mkt_cfg.get("max_hold_days", 10)))
+        dte_exit = int(plan.get("dte_exit_threshold", mkt_cfg.get("dte_exit_threshold", 14)))
+        theta_exit_pct = float(plan.get("theta_exit_pct", mkt_cfg.get("theta_exit_pct", 5)))
+        stale_days = int(plan.get("stale_trade_days", mkt_cfg.get("stale_trade_days", 5)))
+        stale_band = float(plan.get("stale_trade_pnl_band_pct", mkt_cfg.get("stale_trade_pnl_band_pct", 10)))
+
+        if pnl_pct >= tp_pct:
+            return {"action": "exit", "trigger": "take_profit", "reason": f"TP hit: +{pnl_pct:.1f}%", "urgency": 95}
+        if pnl_pct <= -sl_pct:
+            return {"action": "exit", "trigger": "stop_loss", "reason": f"SL hit: {pnl_pct:.1f}%", "urgency": 100}
+
+        trail_price = peak * (1 - trail_pct / 100)
+        if current <= trail_price and peak > entry:
+            return {"action": "exit", "trigger": "trailing_stop", "reason": f"Trail from peak ${peak:.2f}", "urgency": 90}
+
+        dte = market_quote.get("dte") or position.get("contract_dte")
+        if dte is not None and int(dte) <= dte_exit:
+            soft = self._soft_exit_review(
+                position, {"dte": dte, "dte_threshold": dte_exit, "pnl_pct": pnl_pct, "current_price": current},
+                llm_client, "dte_threshold", f"DTE {dte} <= {dte_exit}",
+            )
+            if soft:
+                return soft
+            return {"action": "exit", "trigger": "dte_threshold", "reason": f"DTE {dte} <= {dte_exit}", "urgency": 85}
+
+        theta = market_quote.get("theta")
+        if theta is not None and current > 0:
+            theta_pct = abs(float(theta)) / current * 100
+            if theta_pct >= theta_exit_pct:
+                soft = self._soft_exit_review(
+                    position, {"theta_pct": theta_pct, "dte": dte, "pnl_pct": pnl_pct},
+                    llm_client, "theta_decay", f"Theta {theta_pct:.1f}% of premium/day",
+                )
+                if soft:
+                    return soft
+                return {"action": "exit", "trigger": "theta_decay", "reason": f"Theta {theta_pct:.1f}% of premium/day", "urgency": 75}
+
+        try:
+            entry_dt = datetime.fromisoformat(str(position.get("entry_time", "")).replace("Z", "+00:00"))
+            hold_days = (datetime.now(timezone.utc) - entry_dt).days
+        except Exception:
+            hold_days = 0
+
+        if hold_days >= max_hold:
+            soft = self._soft_exit_review(
+                position, {"max_hold_days": max_hold, "hold_days": hold_days, "pnl_pct": pnl_pct, "current_price": current},
+                llm_client, "max_hold", f"Max hold {hold_days}d exceeded",
+            )
+            if soft:
+                return soft
+            return {"action": "exit", "trigger": "max_hold", "reason": f"Max hold {hold_days}d exceeded", "urgency": 65}
+
+        if hold_days >= stale_days and abs(pnl_pct) <= stale_band:
+            soft = self._soft_exit_review(
+                position, {"stale": True, "hold_days": hold_days, "pnl_pct": pnl_pct},
+                llm_client, "stale_trade", "Stale flat trade",
+            )
+            if soft:
+                return soft
+
+        return {
+            "action": "hold",
+            "pnl_pct": safe_round(pnl_pct),
+            "hold_days": hold_days,
+            "peak_price": safe_round(peak),
+            "next_triggers": {
+                "take_profit_at": safe_round(entry * (1 + tp_pct / 100)),
+                "stop_loss_at": safe_round(entry * (1 - sl_pct / 100)),
+                "dte_exit": dte_exit,
+                "max_hold_days": max_hold,
+            },
+        }
+
+    def _soft_exit_review(self, position, market_context, llm_client, trigger, fallback_reason):
+        """When LLM exit is enabled, it can override soft limits (hold vs exit). Returns None if LLM off → use hard rule."""
+        llm = llm_client or self.llm
+        if not (llm_enabled("exit") and llm):
+            return None
+        llm_result = llm_exit_reasoning({**position, **market_context}, market_context, llm)
+        if llm_result.get("error"):
+            return None
+        if llm_result.get("action") == "exit":
+            return {
+                "action": "exit",
+                "trigger": trigger,
+                "reason": llm_result.get("reasoning", fallback_reason),
+                "urgency": llm_result.get("urgency", 60),
+                "llm": llm_result,
+            }
+        return {
+            "action": "hold",
+            "trigger": trigger,
+            "reason": llm_result.get("reasoning", "LLM: thesis still valid"),
+            "llm": llm_result,
+            "llm_override": True,
+            "pnl_pct": market_context.get("pnl_pct"),
+        }

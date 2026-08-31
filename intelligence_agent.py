@@ -727,6 +727,121 @@ def fetch_seasonality(symbol: str) -> dict:
     return result
 
 
+def _map_earnings_timing(hour_token: str) -> Optional[str]:
+    if not hour_token:
+        return None
+    token = hour_token.strip().upper()
+    if token in ("AMC", "AFTER", "AFTER MARKET CLOSE"):
+        return "AMC"
+    if token in ("BMO", "BEFORE", "BEFORE MARKET OPEN"):
+        return "BMO"
+    if token in ("DMH", "DURING"):
+        return "DMH"
+    return token
+
+
+def fetch_next_quarterly_earnings(symbol: str) -> dict:
+    """
+    Next quarterly earnings from Finnhub calendar (primary).
+    Finviz month/day is only a fallback and is rejected if >100 days out.
+    """
+    sym = symbol.upper().strip()
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    empty = {
+        "earnings_date": None,
+        "earnings_timing": None,
+        "earnings_days_away": None,
+        "earnings_quarter": None,
+        "earnings_fiscal_year": None,
+        "earnings_source": None,
+    }
+
+    api_key = os.getenv("FINNHUB_API_KEY", "")
+    if api_key:
+        try:
+            resp = requests.get(
+                "https://finnhub.io/api/v1/calendar/earnings",
+                params={
+                    "symbol": sym,
+                    "from": today.isoformat(),
+                    "to": (today + timedelta(days=120)).isoformat(),
+                    "token": api_key,
+                },
+                headers=_BROWSER_HEADERS,
+                timeout=8,
+            )
+            if resp.status_code == 200:
+                entries = resp.json().get("earningsCalendar") or []
+                matching = [e for e in entries if str(e.get("symbol", "")).upper() == sym and e.get("date")]
+                if matching:
+                    entry = sorted(matching, key=lambda e: e["date"])[0]
+                    ed = datetime.strptime(entry["date"], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    days_away = (ed.date() - today).days
+                    quarter = entry.get("quarter")
+                    fiscal_year = entry.get("year")
+                    return {
+                        "earnings_date": entry["date"],
+                        "earnings_timing": _map_earnings_timing(entry.get("hour") or ""),
+                        "earnings_days_away": days_away,
+                        "earnings_quarter": f"Q{quarter}" if quarter else None,
+                        "earnings_fiscal_year": fiscal_year,
+                        "earnings_source": "Finnhub quarterly calendar",
+                    }
+        except Exception:
+            pass
+
+    return empty
+
+
+def _parse_finviz_earnings_fallback(earnings_raw: str, now: datetime) -> dict:
+    """Parse Finviz 'Earnings' snapshot; only accept if within ~100 days (next quarter window)."""
+    empty = {
+        "earnings_date": None,
+        "earnings_timing": None,
+        "earnings_days_away": None,
+        "earnings_quarter": None,
+        "earnings_fiscal_year": None,
+        "earnings_source": None,
+    }
+    if not earnings_raw or earnings_raw == "-":
+        return empty
+
+    parts_e = earnings_raw.split()
+    timing_token = None
+    if len(parts_e) >= 3 and parts_e[-1] in ("AMC", "BMO"):
+        timing_token = parts_e[-1]
+        date_str = " ".join(parts_e[:-1])
+    else:
+        date_str = earnings_raw
+
+    candidates = []
+    for year in (now.year, now.year + 1):
+        try:
+            ed = datetime.strptime(f"{date_str} {year}", "%b %d %Y").replace(tzinfo=timezone.utc)
+            candidates.append(ed)
+        except ValueError:
+            continue
+
+    future = [ed for ed in candidates if (ed - now).days >= -7]
+    if not future:
+        return empty
+
+    best = min(future, key=lambda ed: (ed - now).days)
+    days_away = (best.date() - now.date()).days
+    if days_away > 100:
+        return empty
+
+    return {
+        "earnings_date": best.strftime("%Y-%m-%d"),
+        "earnings_timing": timing_token,
+        "earnings_days_away": days_away,
+        "earnings_quarter": None,
+        "earnings_fiscal_year": best.year,
+        "earnings_source": "Finviz snapshot (fallback)",
+    }
+
+
 # ─────────────────────────────────────────────────────────────────
 # 6. Finviz Analyst Targets & Short Float Valuation
 # ─────────────────────────────────────────────────────────────────
@@ -745,6 +860,7 @@ def fetch_analyst_and_valuation(symbol: str) -> dict:
     url = f"https://finviz.com/quote.ashx?t={urllib.parse.quote(symbol)}"
     resp = _browser_get(url, timeout=8)
     if not resp:
+        earnings_info = fetch_next_quarterly_earnings(symbol)
         result = {
             "symbol": symbol,
             "source": "Finviz Financial Intelligence",
@@ -754,9 +870,12 @@ def fetch_analyst_and_valuation(symbol: str) -> dict:
             "recommendation_label": "Buy",
             "short_float_pct": "—",
             "forward_pe": None,
-            "earnings_date": None,
-            "earnings_timing": None,
-            "earnings_days_away": None,
+            "earnings_date": earnings_info.get("earnings_date"),
+            "earnings_timing": earnings_info.get("earnings_timing"),
+            "earnings_days_away": earnings_info.get("earnings_days_away"),
+            "earnings_quarter": earnings_info.get("earnings_quarter"),
+            "earnings_fiscal_year": earnings_info.get("earnings_fiscal_year"),
+            "earnings_source": earnings_info.get("earnings_source"),
             "analyst_actions": [],
             "summary": "Valuation metrics temporarily unavailable.",
             "as_of": datetime.now(timezone.utc).isoformat(),
@@ -814,35 +933,17 @@ def fetch_analyst_and_valuation(symbol: str) -> dict:
     else:
         squeeze_risk = "Normal / Low Float Short"
 
-    # ── Earnings Date (IV Crush Shield) ───────────────────────
-    earnings_raw = m.get("Earnings", "").strip()
-    earnings_date = None
-    earnings_timing = None  # AMC = After Market Close, BMO = Before Market Open
-    earnings_days_away = None
-    if earnings_raw and earnings_raw != "-":
-        # Format: "Aug 03 AMC" or "Nov 04 BMO"
-        parts_e = earnings_raw.split()
-        timing_token = None
-        if len(parts_e) >= 3 and parts_e[-1] in ("AMC", "BMO"):
-            timing_token = parts_e[-1]
-            date_str = " ".join(parts_e[:-1])
-        else:
-            date_str = earnings_raw
-        try:
-            now = datetime.now(timezone.utc)
-            # Try parsing with current year first, then next year
-            for try_year in [now.year, now.year + 1]:
-                try:
-                    ed = datetime.strptime(f"{date_str} {try_year}", "%b %d %Y").replace(tzinfo=timezone.utc)
-                    if ed >= now - timedelta(days=7):  # allow up to 7 days in past
-                        earnings_date = ed.strftime("%Y-%m-%d")
-                        earnings_timing = timing_token
-                        earnings_days_away = (ed - now).days
-                        break
-                except ValueError:
-                    continue
-        except Exception:
-            pass
+    # ── Next quarterly earnings (Finnhub primary, Finviz fallback) ──
+    now = datetime.now(timezone.utc)
+    earnings_info = fetch_next_quarterly_earnings(symbol)
+    if not earnings_info.get("earnings_date"):
+        earnings_info = _parse_finviz_earnings_fallback(m.get("Earnings", "").strip(), now)
+    earnings_date = earnings_info.get("earnings_date")
+    earnings_timing = earnings_info.get("earnings_timing")
+    earnings_days_away = earnings_info.get("earnings_days_away")
+    earnings_quarter = earnings_info.get("earnings_quarter")
+    earnings_fiscal_year = earnings_info.get("earnings_fiscal_year")
+    earnings_source = earnings_info.get("earnings_source")
 
     # ── Analyst Upgrades / Downgrades (from same page) ────────
     analyst_actions = []
@@ -876,8 +977,9 @@ def fetch_analyst_and_valuation(symbol: str) -> dict:
     if forward_pe:
         parts.append(f"Fwd P/E: {forward_pe:.1f}")
     if earnings_date:
+        q_label = f" ({earnings_quarter} FY{earnings_fiscal_year})" if earnings_quarter else ""
         days_label = f"in {earnings_days_away}d" if earnings_days_away and earnings_days_away > 0 else "recent"
-        parts.append(f"Earnings: {earnings_date} {earnings_timing or ''} ({days_label})")
+        parts.append(f"Next quarterly earnings{q_label}: {earnings_date} {earnings_timing or ''} ({days_label})")
     if recent_upgrades > 0:
         parts.append(f"Analyst Upgrades: {recent_upgrades} recent")
 
@@ -905,6 +1007,9 @@ def fetch_analyst_and_valuation(symbol: str) -> dict:
         "earnings_date": earnings_date,
         "earnings_timing": earnings_timing,
         "earnings_days_away": earnings_days_away,
+        "earnings_quarter": earnings_quarter,
+        "earnings_fiscal_year": earnings_fiscal_year,
+        "earnings_source": earnings_source,
         "analyst_actions": analyst_actions,
         "recent_upgrades": recent_upgrades,
         "recent_downgrades": recent_downgrades,
@@ -1084,4 +1189,7 @@ def compute_intelligence_scoring(symbol: str, full_intel: dict) -> dict:
         "earnings_date": earnings_date,
         "earnings_days_away": earnings_days,
         "earnings_timing": val.get("earnings_timing"),
+        "earnings_quarter": val.get("earnings_quarter"),
+        "earnings_fiscal_year": val.get("earnings_fiscal_year"),
+        "earnings_source": val.get("earnings_source"),
     }

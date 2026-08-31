@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 import time
 from typing import Any, Dict, Optional
 import urllib.parse
@@ -15,8 +16,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import uvicorn
 
-from alpaca_service import alpaca_account_summary
-from agents import OmniRouteClient, ResearcherAgent, TechnicalConfirmationAgent, TraderAgent
+from alpaca_service import alpaca_account_summary, close_position, get_positions
+from agents import OmniRouteClient, PositionManager, ResearcherAgent, TechnicalConfirmationAgent, TraderAgent
 from data_feed_router import DataFeedRouter
 from intelligence_agent import (
     fetch_all_intelligence,
@@ -56,6 +57,7 @@ llm_client = OmniRouteClient()
 researcher = ResearcherAgent(llm_client)
 technical = TechnicalConfirmationAgent()
 trader = TraderAgent(llm_client)
+position_manager = PositionManager(llm_client)
 data_feeds = DataFeedRouter()
 
 DEFAULT_MARKET_DIGEST = """
@@ -190,8 +192,23 @@ pipeline_state: Dict[str, Any] = {
         "snapshot": None,
     },
     "option_stream": alpaca_option_stream.snapshot(),
-    "events": []
+    "events": [],
+    "positions": [],
+    "position_monitor": {
+        "status": "idle",
+        "last_check": None,
+        "last_actions": [],
+    },
+    "llm_cost": {},
+    "llm_status": {},
+    "llm_activity": [],
+    "portfolio_review": {},
 }
+
+
+_scan_lock = threading.Lock()
+_scan_running = False
+_monitor_stop = threading.Event()
 
 
 def utc_now() -> str:
@@ -234,7 +251,7 @@ def refresh_alpaca_status(force: bool = False) -> Dict[str, Any]:
         blocked = summary.get("trading_blocked") or summary.get("account_blocked")
         options_level = summary.get("options_trading_level") or summary.get("options_approved_level")
         status = "blocked" if blocked else "ok"
-        detail = f"Paper account {summary.get('account_status')}; options level {options_level}"
+        detail = f"Paper · Cash ${float(summary.get('cash') or 0):,.0f} (sizing) · BP ${float(summary.get('buying_power') or 0):,.0f} (not used)"
         payload = {
             **summary,
             "status": status,
@@ -383,13 +400,10 @@ def tradingview_stage_status() -> Dict[str, str]:
 def run_research_scan(market_digest: str = DEFAULT_MARKET_DIGEST) -> Dict[str, Any]:
     pipeline_state["stages"] = [stage.copy() for stage in PIPELINE_TEMPLATE]
     pipeline_state["status"] = "researching"
-    stage_status("discovery", "running", "Scanning sector ETF momentum")
-    stage_status("market", "running", "Loading price, trend, and volume metrics")
-    stage_status("sources", "running", "Running news, social, and data-source agents")
-    stage_status("research", "running", "Preparing bull/bear/risk debate")
+    pipeline_state["updated_at"] = utc_now()
     event("Dynamic discovery scan started: identifying active sectors before deep analysis.", "info")
 
-    research = researcher.scan_market(market_digest)
+    research = researcher.scan_market(market_digest, on_stage=stage_status)
     pipeline_state["research"] = research
     lean_export_path = write_lean_universe(research)
     lean_universe = build_lean_universe(research)
@@ -441,6 +455,10 @@ def run_research_scan(market_digest: str = DEFAULT_MARKET_DIGEST) -> Dict[str, A
     event(f"LEAN watchlist export refreshed with {pipeline_state['lean']['candidate_count']} candidates.", "info")
     event(f"Data feed router refreshed: {data_feed_status['detail']}.", "info")
     event(f"Alpaca option stream: {option_stream_status['detail']}.", "info")
+    refresh_llm_state()
+    if pipeline_state.get("research"):
+        pipeline_state["research"]["llm_activity"] = pipeline_state.get("llm_activity", [])
+    run_portfolio_review()
     return research
 
 
@@ -578,6 +596,126 @@ def verify_tradingview_secret(data: Dict[str, Any], request: Request) -> bool:
     return bool(expected and supplied and supplied == expected)
 
 
+def build_account_context() -> Dict[str, Any]:
+    alpaca = pipeline_state.get("alpaca") or {}
+    open_positions = alpaca.get("open_option_positions", 0)
+    if not open_positions:
+        open_positions = len([p for p in (alpaca.get("positions") or []) if p.get("symbol") and not p.get("error")])
+    return {
+        "cash": alpaca.get("cash"),
+        "buying_power": alpaca.get("buying_power"),
+        "equity": alpaca.get("equity"),
+        "open_option_positions": open_positions,
+        "paper": alpaca.get("paper"),
+    }
+
+
+def _is_market_hours() -> bool:
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        now = datetime.now(timezone.utc)
+    if now.weekday() >= 5:
+        return False
+    minutes = now.hour * 60 + now.minute
+    return 9 * 60 + 30 <= minutes <= 16 * 60
+
+
+def refresh_llm_state() -> Dict[str, Any]:
+    try:
+        from llm_service import get_llm_activity, get_llm_status, get_session_cost
+        pipeline_state["llm_status"] = get_llm_status()
+        pipeline_state["llm_activity"] = get_llm_activity()[:30]
+        pipeline_state["llm_cost"] = get_session_cost()
+    except Exception as exc:
+        pipeline_state["llm_status"] = {"configured": False, "reason": str(exc)[:200]}
+    return pipeline_state.get("llm_status", {})
+
+
+def run_portfolio_review() -> Dict[str, Any]:
+    from llm_service import llm_portfolio_review
+    positions = pipeline_state.get("positions") or refresh_positions()
+    open_positions = [p for p in positions if p.get("status") != "closed"]
+    if not open_positions:
+        pipeline_state["portfolio_review"] = {"status": "empty", "summary": "No open positions to review"}
+        return pipeline_state["portfolio_review"]
+    research = pipeline_state.get("research") or {}
+    market_context = {
+        "debate_regime": (research.get("debate") or {}).get("risk", {}).get("market_regime"),
+        "themes": [t.get("name") for t in (research.get("themes") or [])[:5]],
+        "spy": ((research.get("raw_inputs") or {}).get("market") or {}),
+    }
+    review = llm_portfolio_review(open_positions, market_context, llm_client)
+    pipeline_state["portfolio_review"] = {**review, "reviewed_at": utc_now(), "position_count": len(open_positions)}
+    return pipeline_state["portfolio_review"]
+
+
+def refresh_positions() -> list:
+    positions = get_positions()
+    if positions and positions[0].get("error"):
+        pipeline_state["positions"] = position_manager.list_positions()
+        return pipeline_state["positions"]
+    position_manager.sync_from_alpaca(positions)
+    enriched = []
+    for pos in position_manager.list_positions():
+        if pos.get("status") != "open":
+            continue
+        quote = {"mid": pos.get("current_price"), "dte": pos.get("contract_dte")}
+        for ap in positions:
+            if ap.get("symbol") == pos.get("symbol"):
+                quote = {
+                    "mid": ap.get("current_price"),
+                    "dte": ap.get("dte"),
+                    "current_price": ap.get("current_price"),
+                }
+                pos["unrealized_plpc"] = ap.get("unrealized_plpc")
+                break
+        exit_eval = position_manager.evaluate_exit(pos, quote, llm_client)
+        enriched.append({**pos, "exit_evaluation": exit_eval, **quote})
+    pipeline_state["positions"] = enriched
+    return enriched
+
+
+def _position_monitor_loop():
+    while not _monitor_stop.is_set():
+        try:
+            if _is_market_hours():
+                pipeline_state["position_monitor"]["status"] = "running"
+                refresh_alpaca_status(force=True)
+                positions = refresh_positions()
+                actions = []
+                for pos in positions:
+                    ev = pos.get("exit_evaluation") or {}
+                    if ev.get("action") == "exit":
+                        result = close_position(pos["symbol"], pos.get("qty"))
+                        actions.append({
+                            "symbol": pos["symbol"],
+                            "trigger": ev.get("trigger"),
+                            "reason": ev.get("reason"),
+                            "result": result,
+                            "time": utc_now(),
+                        })
+                        position_manager.close_position_record(pos["symbol"], ev.get("reason", ""))
+                pipeline_state["position_monitor"]["last_actions"] = actions[:10]
+                pipeline_state["position_monitor"]["last_check"] = utc_now()
+                if positions:
+                    run_portfolio_review()
+                if actions:
+                    event(f"Position monitor: {len(actions)} exit(s) triggered", "warning")
+            else:
+                pipeline_state["position_monitor"]["status"] = "market_closed"
+        except Exception as exc:
+            pipeline_state["position_monitor"]["status"] = "error"
+            pipeline_state["position_monitor"]["last_error"] = str(exc)[:200]
+        _monitor_stop.wait(60)
+
+
+def start_position_monitor():
+    thread = threading.Thread(target=_position_monitor_loop, name="position-monitor", daemon=True)
+    thread.start()
+
+
 def process_signal(signal: TradingViewSignal) -> Dict[str, Any]:
     if not pipeline_state["research"]:
         run_research_scan()
@@ -627,7 +765,12 @@ def process_signal(signal: TradingViewSignal) -> Dict[str, Any]:
         stage_status("tradingview", "simulated", f"Test signal matched {signal.ticker.upper()}; real TradingView still not verified")
     stage_status("decision", "running", "Evaluating options risk and contract requirements")
 
-    decision = trader.evaluate_trade(signal_payload, pipeline_state["research"], confirmation)
+    decision = trader.evaluate_trade(
+        signal_payload,
+        pipeline_state["research"],
+        confirmation,
+        build_account_context(),
+    )
     pipeline_state["last_decision"] = decision
 
     if decision.get("decision") not in {"approved_for_paper_order", "test_plan_only"} or decision.get("confidence", 0) < 0.65:
@@ -647,6 +790,17 @@ def process_signal(signal: TradingViewSignal) -> Dict[str, Any]:
         "done",
         f"Approved paper plan for {contract_symbol}" if is_real_tv else f"Test plan only for {contract_symbol}"
     )
+    plan = decision.get("contract_plan", {})
+    if contract_symbol and plan:
+        position_manager.register_position({
+            "symbol": contract_symbol,
+            "underlying": signal.ticker.upper(),
+            "qty": plan.get("max_contracts", 1),
+            "entry_price": plan.get("mid_price") or (plan.get("premium", 0) / 100 if plan.get("premium") else 0),
+            "trade_plan": plan,
+            "contract_dte": plan.get("contract_dte"),
+        })
+        refresh_positions()
     execution = {
         "status": "disabled",
         "message": "Alpaca execution is intentionally deferred to the next phase.",
@@ -670,11 +824,13 @@ def process_signal(signal: TradingViewSignal) -> Dict[str, Any]:
 @app.on_event("startup")
 def startup_scan() -> None:
     alpaca_option_stream.start()
+    start_position_monitor()
     run_research_scan()
 
 
 @app.on_event("shutdown")
 def shutdown_stream() -> None:
+    _monitor_stop.set()
     alpaca_option_stream.stop()
 
 
@@ -688,18 +844,43 @@ def get_pipeline():
     refresh_alpaca_status()
     refresh_data_feed_status()
     pipeline_state["option_stream"] = alpaca_option_stream.snapshot()
+    refresh_llm_state()
+    refresh_positions()
     return pipeline_state
+
+
+@app.get("/api/llm/status")
+def llm_status_route():
+    return {"status": "ok", "llm": refresh_llm_state(), "activity": pipeline_state.get("llm_activity", [])}
+
+
+@app.get("/api/positions")
+def positions_route():
+    return {"status": "ok", "positions": refresh_positions(), "monitor": pipeline_state.get("position_monitor", {})}
 
 
 @app.post("/api/research/run")
 async def research_run(request: Request):
+    global _scan_running
+    if _scan_running:
+        return {"status": "already_running", "message": "A scan is already in progress"}
     try:
         payload = await request.json()
     except Exception:
         payload = {}
     digest = payload.get("market_digest") or DEFAULT_MARKET_DIGEST
-    research = run_research_scan(digest)
-    return {"status": "ok", "research": research, "pipeline": pipeline_state}
+
+    def _background_scan():
+        global _scan_running
+        try:
+            _scan_running = True
+            run_research_scan(digest)
+        finally:
+            _scan_running = False
+
+    thread = threading.Thread(target=_background_scan, name="research-scan", daemon=True)
+    thread.start()
+    return {"status": "started", "message": "Scan started — poll /api/pipeline for progress"}
 
 
 @app.get("/api/tradingview/watchlist")
