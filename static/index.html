@@ -6,7 +6,7 @@
     <title>Trading Pipeline</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css?v=9">
+    <link rel="stylesheet" href="/static/style.css?v=11">
 </head>
 <body>
     <!-- Top Bar -->
@@ -95,39 +95,26 @@
                     <div class="lane-drawer" id="drawer-sec" style="display:none;"></div>
                 </div>
             </div>
+
+            <!-- Selected Universe & Research Team (stacked below data sources) -->
+            <div class="sub-phases">
+                <div class="compact-phase-card" id="compact-selection" title="Click to view Selected Universe">
+                    <span class="compact-icon">🎯</span>
+                    <div class="compact-info">
+                        <strong>Selected Universe</strong>
+                    </div>
+                    <span class="compact-badge" id="compact-selection-badge">0 tickers</span>
+                </div>
+
+                <div class="compact-phase-card" id="compact-research" title="Click to view Research Team">
+                    <span class="compact-icon">🔬</span>
+                    <div class="compact-info">
+                        <strong>Research Team</strong>
+                    </div>
+                    <span class="compact-badge" id="compact-research-badge">--</span>
+                </div>
+            </div>
         </section>
-
-        <!-- Arrow -->
-        <div class="arrow-connector">
-            <svg width="48" height="24" viewBox="0 0 48 24" fill="none">
-                <path d="M0 12H40M32 4L40 12L32 20" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-        </div>
-
-        <!-- ── Selected Universe (Compact Card) ── -->
-        <div class="compact-phase-card" id="compact-selection" title="Click to view Selected Universe">
-            <span class="compact-icon">🎯</span>
-            <div class="compact-info">
-                <strong>Selected Universe</strong>
-            </div>
-            <span class="compact-badge" id="compact-selection-badge">0 tickers</span>
-        </div>
-
-        <!-- Arrow -->
-        <div class="arrow-connector">
-            <svg width="48" height="24" viewBox="0 0 48 24" fill="none">
-                <path d="M0 12H40M32 4L40 12L32 20" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-        </div>
-
-        <!-- ── Research Team (Compact Card) ── -->
-        <div class="compact-phase-card" id="compact-research" title="Click to view Research Team">
-            <span class="compact-icon">🔬</span>
-            <div class="compact-info">
-                <strong>Research Team</strong>
-            </div>
-            <span class="compact-badge" id="compact-research-badge">--</span>
-        </div>
 
         <!-- Arrow -->
         <div class="arrow-connector">
@@ -173,9 +160,9 @@
             </svg>
         </div>
 
-        <!-- ── Phase 4: Execution ────────────────────────── -->
+        <!-- ── Execution & Positions (combined) ──────────── -->
         <section class="phase" id="ph-exec">
-            <div class="phase-label">Execution</div>
+            <div class="phase-label">Execution & Positions</div>
             <div class="exec-body">
                 <div class="exec-icon">💰</div>
                 <div class="exec-rows">
@@ -197,12 +184,8 @@
                     </div>
                 </div>
             </div>
-        </section>
-
-        <!-- ── Position Manager ── -->
-        <section class="phase" id="ph-positions">
-            <div class="phase-label">Position Manager</div>
-            <div class="position-panel">
+            <!-- Position Manager (stacked below execution) -->
+            <div class="position-panel" id="ph-positions">
                 <div class="position-header">
                     <span class="pill-sm" id="position-monitor-status">Idle</span>
                     <span class="position-cost" id="llm-cost-display">LLM: --</span>
@@ -433,6 +416,6 @@
         </div>
     </div>
 
-    <script src="/static/app.js?v=11"></script>
+    <script src="/static/app.js?v=12"></script>
 </body>
 </html>

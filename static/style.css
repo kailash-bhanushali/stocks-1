@@ -2145,19 +2145,27 @@ button:disabled {
     filter: drop-shadow(0 0 4px rgba(52, 211, 153, 0.5));
 }
 
+/* ── Sub-Phases Container (stacked below data sources) ── */
+.sub-phases {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 8px 10px;
+    border-top: 1px solid var(--border);
+    background: var(--card);
+}
+
 /* ── Compact Phase Cards ── */
 .compact-phase-card {
     display: flex;
     align-items: center;
     gap: 10px;
-    padding: 10px 16px;
+    padding: 8px 12px;
     background: var(--surface);
     border: 1px solid var(--border-hi);
     border-radius: var(--radius);
     cursor: pointer;
     transition: background 0.15s, border-color 0.15s, box-shadow 0.15s;
-    flex-shrink: 0;
-    align-self: center;
 }
 
 .compact-phase-card:hover {
@@ -2209,8 +2217,7 @@ button:disabled {
 /* ── Position Manager ── */
 .position-panel {
     background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: 10px;
+    border-top: 1px solid var(--border);
     padding: 12px;
 }
 
